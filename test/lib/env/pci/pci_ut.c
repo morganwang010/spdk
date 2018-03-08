@@ -31,14 +31,11 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <unistd.h>
-#include <stdlib.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-
-#include "spdk/env.h"
+#include "spdk/stdinc.h"
 
 #include "CUnit/Basic.h"
+
+#include "env_dpdk/pci.c"
 
 static void
 pci_test(void)
@@ -54,7 +51,7 @@ pci_test(void)
 	pci_addr.func = 1;
 
 	rc = spdk_pci_device_claim(&pci_addr);
-	CU_ASSERT(rc == 0);
+	CU_ASSERT(rc >= 0);
 
 	childPid = fork();
 	CU_ASSERT(childPid >= 0);

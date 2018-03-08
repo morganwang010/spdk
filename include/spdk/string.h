@@ -38,12 +38,11 @@
 #ifndef SPDK_STRING_H
 #define SPDK_STRING_H
 
+#include "spdk/stdinc.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-#include <stdarg.h>
-#include <stddef.h>
 
 /**
  * sprintf with automatic buffer allocation.
@@ -91,6 +90,35 @@ char *spdk_strsepq(char **stringp, const char *delim);
 char *spdk_str_trim(char *s);
 
 /**
+ * Copy the string version of an error into the user supplied buffer
+ *
+ * \param errnum Error code
+ * \param buf Pointer to a buffer in which to place the error message
+ * \param buflen the size of the buffer in bytes
+ */
+void spdk_strerror_r(int errnum, char *buf, size_t buflen);
+
+/**
+ * Return the string version of an error from a static, thread-local buffer.
+ * This function is thread safe.
+ *
+ * \param errnum Error code
+ *
+ * \return pointer to buffer upon success.
+ */
+const char *spdk_strerror(int errnum);
+
+/**
+ * Remove trailing newlines from the end of a string in place.
+ *
+ * Any sequence of trailing \r and \n characters is removed from the end of the string.
+ *
+ * \param s String to remove newline from.
+ * \return Number of characters removed.
+ */
+size_t spdk_str_chomp(char *s);
+
+/**
  * Copy a string into a fixed-size buffer, padding extra bytes with a specific character.
  *
  * \param dst Pointer to destination fixed-size buffer to fill.
@@ -112,6 +140,45 @@ void spdk_strcpy_pad(void *dst, const char *src, size_t size, int pad);
  * \return Length of the non-padded portion of str.
  */
 size_t spdk_strlen_pad(const void *str, size_t size, int pad);
+
+/**
+ * Parse an IP address into its hostname and port components.
+ * This modifies the IP address in place.
+ *
+ * \param ip A null terminated IP address, including port.
+ *           Both IPv4 and IPv6 are supported.
+ * \param host Will point to the start of the hostname within ip.
+ *             The string will be null terminated.
+ * \param port Will point to the start of the port within ip.
+ *             The string will be null terminated.
+ *
+ * \return 0 if successful. -1 on error.
+ */
+int spdk_parse_ip_addr(char *ip, char **host, char **port);
+
+/**
+ * Parse a string representing a number possibly followed by a binary prefix.
+ * The string can contain a trailing "B" (KB,MB,GB) but it's not necessary.
+ * "128K" = 128 * 1024; "2G" = 2 * 1024 * 1024; "2GB" = 2 * 1024 * 1024;
+ * Additionally, lowercase "k", "m", "g" are parsed as well. They are processed
+ * the same as their uppercase equivalents.
+ *
+ * \param cap_str null terminated string
+ * \param cap pointer where the parsed capacity (in bytes) will be put
+ * \param has_prefix pointer to a flag that will be set to describe whether given
+ * string contains a binary prefix
+ * \returned 0 on success, negative errno otherwise
+ */
+int spdk_parse_capacity(const char *cap_str, uint64_t *cap, bool *has_prefix);
+
+/**
+ * Check if a buffer is all zero (0x00) bytes or not.
+ *
+ * \param data Buffer to check.
+ * \param size Size of data in bytes.
+ * \return true if data consists entirely of zeroes, or false if any byte in data is not zero.
+ */
+bool spdk_mem_all_zero(const void *data, size_t size);
 
 #ifdef __cplusplus
 }

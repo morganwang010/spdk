@@ -34,55 +34,60 @@
 #ifndef NVMF_TGT_H
 #define NVMF_TGT_H
 
-#include <stdint.h>
+#include "spdk/stdinc.h"
 
 #include "spdk/nvmf.h"
 #include "spdk/queue.h"
+#include "spdk/event.h"
 
 struct rpc_listen_address {
 	char *transport;
+	char *adrfam;
 	char *traddr;
 	char *trsvcid;
 };
 
 struct spdk_nvmf_tgt_conf {
-	uint32_t acceptor_lcore;
 	uint32_t acceptor_poll_rate;
 };
 
-struct nvmf_tgt_subsystem {
-	struct spdk_nvmf_subsystem *subsystem;
-	struct spdk_poller *poller;
+enum nvmf_tgt_state {
+	NVMF_TGT_INIT_NONE = 0,
+	NVMF_TGT_INIT_PARSE_CONFIG,
+	NVMF_TGT_INIT_CREATE_POLL_GROUPS,
+	NVMF_TGT_INIT_START_SUBSYSTEMS,
+	NVMF_TGT_INIT_START_ACCEPTOR,
+	NVMF_TGT_RUNNING,
+	NVMF_TGT_FINI_STOP_ACCEPTOR,
+	NVMF_TGT_FINI_DESTROY_POLL_GROUPS,
+	NVMF_TGT_FINI_STOP_SUBSYSTEMS,
+	NVMF_TGT_FINI_FREE_RESOURCES,
+	NVMF_TGT_STOPPED,
+	NVMF_TGT_ERROR,
+};
 
-	TAILQ_ENTRY(nvmf_tgt_subsystem) tailq;
+struct nvmf_tgt {
+	enum nvmf_tgt_state state;
 
-	uint32_t lcore;
+	struct spdk_nvmf_tgt *tgt;
+
+	uint32_t core; /* Round-robin tracking of cores for qpair assignment */
 };
 
 extern struct spdk_nvmf_tgt_conf g_spdk_nvmf_tgt_conf;
 
-struct nvmf_tgt_subsystem *
-nvmf_tgt_subsystem_first(void);
-
-struct nvmf_tgt_subsystem *
-nvmf_tgt_subsystem_next(struct nvmf_tgt_subsystem *subsystem);
+extern struct nvmf_tgt g_tgt;
 
 int spdk_nvmf_parse_conf(void);
 
-void nvmf_tgt_start_subsystem(struct nvmf_tgt_subsystem *subsystem);
+struct spdk_nvmf_subsystem *nvmf_tgt_create_subsystem(const char *name,
+		enum spdk_nvmf_subtype subtype, uint32_t num_ns);
 
-struct nvmf_tgt_subsystem *nvmf_tgt_create_subsystem(const char *name,
-		enum spdk_nvmf_subtype subtype,
-		enum spdk_nvmf_subsystem_mode mode,
-		uint32_t lcore);
+struct spdk_nvmf_subsystem *spdk_nvmf_construct_subsystem(const char *name,
+		int num_listen_addresses, struct rpc_listen_address *addresses,
+		int num_hosts, char *hosts[], bool allow_any_host,
+		const char *sn);
 
-int
-spdk_nvmf_parse_subsystem_for_rpc(const char *name,
-				  const char *mode, uint32_t lcore,
-				  int num_listen_addresses, struct rpc_listen_address *addresses,
-				  int num_hosts, char *hosts[], const char *bdf,
-				  const char *sn, int num_devs, char *dev_list[]);
+int spdk_nvmf_tgt_start(struct spdk_app_opts *opts);
 
-int
-nvmf_tgt_shutdown_subsystem_by_nqn(const char *nqn);
 #endif

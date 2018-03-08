@@ -33,21 +33,10 @@
 
 SPDK_ROOT_DIR := $(abspath $(CURDIR)/../../../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
-
-APP = pci_ut
-
-C_SRCS = pci_ut.c
+include $(SPDK_ROOT_DIR)/mk/spdk.app.mk
 
 CFLAGS += $(ENV_CFLAGS)
+LIBS += $(ENV_LINKER_ARGS)
+TEST_FILE = pci_ut.c
 
-LIBS += $(ENV_LINKER_ARGS) -lcunit
-
-all: $(APP)
-
-$(APP): $(OBJS) $(ENV_LIBS)
-	$(LINK_C)
-
-clean:
-	$(CLEAN_C) $(APP)
-
-include $(SPDK_ROOT_DIR)/mk/spdk.deps.mk
+include $(SPDK_ROOT_DIR)/mk/spdk.unittest.mk

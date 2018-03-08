@@ -14,7 +14,7 @@ netmask = ('127.0.0.1', '127.0.0.0')
 rpc_param = {
     'target_ip': '127.0.0.1',
     'port': 3260,
-    'initiator_name': 'ALL',
+    'initiator_name': 'ANY',
     'netmask': netmask,
     'lun_total': 3,
     'malloc_bdev_size': 64,
@@ -22,11 +22,14 @@ rpc_param = {
     'queue_depth': 64,
     'target_name': 'Target3',
     'alias_name': 'Target3_alias',
-    'chap_disable': 1,
-    'chap_mutal': 0,
-    'chap_required': 0,
-    'chap_auth_group': 0,
-    'trace_flag': 'rpc'
+    'disable_chap': True,
+    'mutual_chap': False,
+    'require_chap': False,
+    'chap_group': 0,
+    'header_digest': False,
+    'data_digest': False,
+    'trace_flag': 'rpc',
+    'cpumask': 0x1
 }
 
 
@@ -75,6 +78,7 @@ def verify_trace_flag_rpc_methods(rpc_py, rpc_param):
 
     print "verify_trace_flag_rpc_methods passed"
 
+
 def verify_iscsi_connection_rpc_methods(rpc_py):
     rpc = spdk_rpc(rpc_py)
     output = rpc.get_iscsi_connections()
@@ -90,8 +94,7 @@ def verify_iscsi_connection_rpc_methods(rpc_py):
 
     lun_mapping = "Malloc" + str(rpc_param['lun_total']) + ":0"
     net_mapping = portal_tag + ":" + initiator_tag
-    rpc.construct_target_node(rpc_param['target_name'], rpc_param['alias_name'], lun_mapping, net_mapping, rpc_param['queue_depth'],
-                              rpc_param['chap_disable'], rpc_param['chap_mutal'], rpc_param['chap_required'], rpc_param['chap_auth_group'])
+    rpc.construct_target_node(rpc_param['target_name'], rpc_param['alias_name'], lun_mapping, net_mapping, rpc_param['queue_depth'], '-d')
     check_output('iscsiadm -m discovery -t st -p {}'.format(rpc_param['target_ip']), shell=True)
     check_output('iscsiadm -m node --login', shell=True)
     name = json.loads(rpc.get_target_nodes())[0]['name']
@@ -118,6 +121,7 @@ def verify_iscsi_connection_rpc_methods(rpc_py):
 
     print "verify_iscsi_connection_rpc_methods passed"
 
+
 def verify_scsi_devices_rpc_methods(rpc_py):
     rpc = spdk_rpc(rpc_py)
     output = rpc.get_scsi_devices()
@@ -133,14 +137,16 @@ def verify_scsi_devices_rpc_methods(rpc_py):
 
     lun_mapping = "Malloc" + str(rpc_param['lun_total']) + ":0"
     net_mapping = portal_tag + ":" + initiator_tag
-    rpc.construct_target_node(rpc_param['target_name'], rpc_param['alias_name'], lun_mapping, net_mapping, rpc_param['queue_depth'],
-                              rpc_param['chap_disable'], rpc_param['chap_mutal'], rpc_param['chap_required'], rpc_param['chap_auth_group'])
+    rpc.construct_target_node(rpc_param['target_name'], rpc_param['alias_name'], lun_mapping, net_mapping, rpc_param['queue_depth'], '-d')
     check_output('iscsiadm -m discovery -t st -p {}'.format(rpc_param['target_ip']), shell=True)
     check_output('iscsiadm -m node --login', shell=True)
     name = json.loads(rpc.get_target_nodes())[0]['name']
+    output = rpc.get_iscsi_global_params()
+    jsonvalues = json.loads(output)
+    nodebase = jsonvalues['node_base']
     output = rpc.get_scsi_devices()
     jsonvalues = json.loads(output)
-    verify(jsonvalues[0]['device_name'] == rpc_param['target_name'], 1,
+    verify(jsonvalues[0]['device_name'] == nodebase + ":" + rpc_param['target_name'], 1,
            "device name vaule is {}, expected {}".format(jsonvalues[0]['device_name'], rpc_param['target_name']))
     verify(jsonvalues[0]['id'] == 0, 1,
            "device id value is {}, expected 0".format(jsonvalues[0]['id']))
@@ -158,21 +164,13 @@ def verify_scsi_devices_rpc_methods(rpc_py):
     print "verify_scsi_devices_rpc_methods passed"
 
 
-def verify_luns_rpc_methods(rpc_py, rpc_param):
+def create_malloc_bdevs_rpc_methods(rpc_py, rpc_param):
     rpc = spdk_rpc(rpc_py)
-    output = rpc.get_luns()
-    jsonvalue = json.loads(output)
-    verify(not jsonvalue, 1,
-           "get_luns returned {}, expected empty".format(jsonvalue))
 
     for i in range(1, rpc_param['lun_total'] + 1):
         rpc.construct_malloc_bdev(rpc_param['malloc_bdev_size'], rpc_param['malloc_block_size'])
-        output = rpc.get_luns()
-        jsonvalue = json.loads(output)
-        verify(not jsonvalue, 1,
-               "get_luns returned {}, expected empty".format(jsonvalue))
 
-    print "verify_luns_rpc_methods passed"
+    print "create_malloc_bdevs_rpc_methods passed"
 
 
 def verify_portal_groups_rpc_methods(rpc_py, rpc_param):
@@ -190,7 +188,7 @@ def verify_portal_groups_rpc_methods(rpc_py, rpc_param):
     for idx, value in enumerate(lo_ip):
         # The portal group tag must start at 1
         tag = idx + 1
-        rpc.add_portal_group(tag, "{}:{}".format(value, rpc_param['port']))
+        rpc.add_portal_group(tag, "{}:{}@{}".format(value, rpc_param['port'], rpc_param['cpumask']))
         output = rpc.get_portal_groups()
         jsonvalues = json.loads(output)
         verify(len(jsonvalues) == tag, 1,
@@ -202,6 +200,8 @@ def verify_portal_groups_rpc_methods(rpc_py, rpc_param):
                "host value is {}, expected {}".format(value['portals'][0]['host'], rpc_param['target_ip']))
         verify(value['portals'][0]['port'] == str(rpc_param['port']), 1,
                "port value is {}, expected {}".format(value['portals'][0]['port'], str(rpc_param['port'])))
+        verify(value['portals'][0]['cpumask'] == format(rpc_param['cpumask'], '#x'), 1,
+               "cpumask value is {}, expected {}".format(value['portals'][0]['cpumask'], format(rpc_param['cpumask'], '#x')))
         tag_list.append(value['tag'])
         verify(value['tag'] == idx + 1, 1,
                "tag value is {}, expected {}".format(value['tag'], idx + 1))
@@ -220,6 +220,8 @@ def verify_portal_groups_rpc_methods(rpc_py, rpc_param):
                    "host value is {}, expected {}".format(jvalue['portals'][0]['host'], lo_ip[idx + jidx + 1]))
             verify(jvalue['portals'][0]['port'] == str(rpc_param['port']), 1,
                    "port value is {}, expected {}".format(jvalue['portals'][0]['port'], str(rpc_param['port'])))
+            verify(jvalue['portals'][0]['cpumask'] == format(rpc_param['cpumask'], '#x'), 1,
+                   "cpumask value is {}, expected {}".format(jvalue['portals'][0]['cpumask'], format(rpc_param['cpumask'], '#x')))
             verify(jvalue['tag'] != value or jvalue['tag'] == tag_list[idx + jidx + 1], 1,
                    "tag value is {}, expected {} and not {}".format(jvalue['tag'], tag_list[idx + jidx + 1], value))
 
@@ -255,6 +257,43 @@ def verify_initiator_groups_rpc_methods(rpc_py, rpc_param):
         verify(value['netmasks'][0] == rpc_param['netmask'][idx], 1,
                "netmasks value is {}, expected {}".format(value['netmasks'][0], rpc_param['netmask'][idx]))
 
+    for idx, value in enumerate(rpc_param['netmask']):
+        tag = idx + 1
+        rpc.delete_initiators_from_initiator_group(tag, '-n', rpc_param['initiator_name'], '-m', value)
+
+    output = rpc.get_initiator_groups()
+    jsonvalues = json.loads(output)
+    verify(len(jsonvalues) == tag, 1,
+           "get_initiator_groups returned {} groups, expected {}".format(len(jsonvalues), tag))
+
+    for idx, value in enumerate(jsonvalues):
+        verify(value['tag'] == idx + 1, 1,
+               "tag value is {}, expected {}".format(value['tag'], idx + 1))
+        initiators = value.get('initiators')
+        verify(len(initiators) == 0, 1,
+               "length of initiator list is {}, expected 0".format(len(initiators)))
+        netmasks = value.get('netmasks')
+        verify(len(netmasks) == 0, 1,
+               "length of netmask list is {}, expected 0".format(len(netmasks)))
+
+    for idx, value in enumerate(rpc_param['netmask']):
+        tag = idx + 1
+        rpc.add_initiators_to_initiator_group(tag, '-n', rpc_param['initiator_name'], '-m', value)
+    output = rpc.get_initiator_groups()
+    jsonvalues = json.loads(output)
+    verify(len(jsonvalues) == tag, 1,
+           "get_initiator_groups returned {} groups, expected {}".format(len(jsonvalues), tag))
+
+    tag_list = []
+    for idx, value in enumerate(jsonvalues):
+        verify(value['initiators'][0] == rpc_param['initiator_name'], 1,
+               "initiator value is {}, expected {}".format(value['initiators'][0], rpc_param['initiator_name']))
+        tag_list.append(value['tag'])
+        verify(value['tag'] == idx + 1, 1,
+               "tag value is {}, expected {}".format(value['tag'], idx + 1))
+        verify(value['netmasks'][0] == rpc_param['netmask'][idx], 1,
+               "netmasks value is {}, expected {}".format(value['netmasks'][0], rpc_param['netmask'][idx]))
+
     for idx, value in enumerate(tag_list):
         rpc.delete_initiator_group(value)
         output = rpc.get_initiator_groups()
@@ -278,6 +317,9 @@ def verify_target_nodes_rpc_methods(rpc_py, rpc_param):
     rpc = spdk_rpc(rpc_py)
     portal_tag = '1'
     initiator_tag = '1'
+    output = rpc.get_iscsi_global_params()
+    jsonvalues = json.loads(output)
+    nodebase = jsonvalues['node_base']
     output = rpc.get_target_nodes()
     jsonvalues = json.loads(output)
     verify(not jsonvalues, 1,
@@ -289,17 +331,17 @@ def verify_target_nodes_rpc_methods(rpc_py, rpc_param):
 
     lun_mapping = "Malloc" + str(rpc_param['lun_total']) + ":0"
     net_mapping = portal_tag + ":" + initiator_tag
-    rpc.construct_target_node(rpc_param['target_name'], rpc_param['alias_name'], lun_mapping, net_mapping, rpc_param['queue_depth'],
-                              rpc_param['chap_disable'], rpc_param['chap_mutal'], rpc_param['chap_required'], rpc_param['chap_auth_group'])
+    rpc.construct_target_node(rpc_param['target_name'], rpc_param['alias_name'], lun_mapping, net_mapping, rpc_param['queue_depth'], '-d')
     output = rpc.get_target_nodes()
     jsonvalues = json.loads(output)
     verify(len(jsonvalues) == 1, 1,
            "get_target_nodes returned {} nodes, expected 1".format(len(jsonvalues)))
-    verify(jsonvalues[0]['luns'][0]['name'] == "Malloc" + str(rpc_param['lun_total']), 1,
-           "lun_name value is {}, expected Malloc{}".format(jsonvalues[0]['luns'][0]['name'], str(rpc_param['lun_total'])))
+    bdev_name = jsonvalues[0]['luns'][0]['bdev_name']
+    verify(bdev_name == "Malloc" + str(rpc_param['lun_total']), 1,
+           "bdev_name value is {}, expected Malloc{}".format(jsonvalues[0]['luns'][0]['bdev_name'], str(rpc_param['lun_total'])))
     name = jsonvalues[0]['name']
-    verify(name == "iqn.2016-06.io.spdk:" + rpc_param['target_name'], 1,
-           "target name value is {}, expected {}".format(name, "iqn.2016-06.io.spdk:" + rpc_param['target_name']))
+    verify(name == nodebase + ":" + rpc_param['target_name'], 1,
+           "target name value is {}, expected {}".format(name, nodebase + ":" + rpc_param['target_name']))
     verify(jsonvalues[0]['alias_name'] == rpc_param['alias_name'], 1,
            "target alias_name value is {}, expected {}".format(jsonvalues[0]['alias_name'], rpc_param['alias_name']))
     verify(jsonvalues[0]['luns'][0]['id'] == 0, 1,
@@ -310,18 +352,26 @@ def verify_target_nodes_rpc_methods(rpc_py, rpc_param):
            "queue depth value is {}, expected {}".format(jsonvalues[0]['queue_depth'], rpc_param['queue_depth']))
     verify(jsonvalues[0]['pg_ig_maps'][0]['pg_tag'] == int(portal_tag), 1,
            "portal group tag value is {}, expected {}".format(jsonvalues[0]['pg_ig_maps'][0]['pg_tag'], portal_tag))
-    verify(jsonvalues[0]['chap_disabled'] == rpc_param['chap_disable'], 1,
-           "chap disable value is {}, expected {}".format(jsonvalues[0]['chap_disabled'], rpc_param['chap_disable']))
-    verify(jsonvalues[0]['chap_mutual'] == rpc_param['chap_mutal'], 1,
-           "chap mutual value is {}, expected {}".format(jsonvalues[0]['chap_mutual'], rpc_param['chap_mutal']))
-    verify(jsonvalues[0]['chap_required'] == rpc_param['chap_required'], 1,
-           "chap required value is {}, expected {}".format(jsonvalues[0]['chap_required'], rpc_param['chap_required']))
-    verify(jsonvalues[0]['chap_auth_group'] == rpc_param['chap_auth_group'], 1,
-           "chap auth group value is {}, expected {}".format(jsonvalues[0]['chap_auth_group'], rpc_param['chap_auth_group']))
-    output = rpc.get_luns()
-    jsonvalue = json.loads(output)
-    verify(jsonvalue[0]['claimed'] is True, 1,
-           "The claimed value is {}, expected true".format(jsonvalue[0]['claimed']))
+    verify(jsonvalues[0]['disable_chap'] == rpc_param['disable_chap'], 1,
+           "disable chap value is {}, expected {}".format(jsonvalues[0]['disable_chap'], rpc_param['disable_chap']))
+    verify(jsonvalues[0]['mutual_chap'] == rpc_param['mutual_chap'], 1,
+           "chap mutual value is {}, expected {}".format(jsonvalues[0]['mutual_chap'], rpc_param['mutual_chap']))
+    verify(jsonvalues[0]['require_chap'] == rpc_param['require_chap'], 1,
+           "chap required value is {}, expected {}".format(jsonvalues[0]['require_chap'], rpc_param['require_chap']))
+    verify(jsonvalues[0]['chap_group'] == rpc_param['chap_group'], 1,
+           "chap auth group value is {}, expected {}".format(jsonvalues[0]['chap_group'], rpc_param['chap_group']))
+    verify(jsonvalues[0]['header_digest'] == rpc_param['header_digest'], 1,
+           "header digest value is {}, expected {}".format(jsonvalues[0]['header_digest'], rpc_param['header_digest']))
+    verify(jsonvalues[0]['data_digest'] == rpc_param['data_digest'], 1,
+           "data digest value is {}, expected {}".format(jsonvalues[0]['data_digest'], rpc_param['data_digest']))
+    lun_id = '1'
+    rpc.target_node_add_lun(name, bdev_name, "-i", lun_id)
+    output = rpc.get_target_nodes()
+    jsonvalues = json.loads(output)
+    verify(jsonvalues[0]['luns'][1]['bdev_name'] == "Malloc" + str(rpc_param['lun_total']), 1,
+           "bdev_name value is {}, expected Malloc{}".format(jsonvalues[0]['luns'][0]['bdev_name'], str(rpc_param['lun_total'])))
+    verify(jsonvalues[0]['luns'][1]['id'] == 1, 1,
+           "lun id value is {}, expected 1".format(jsonvalues[0]['luns'][1]['id']))
 
     rpc.delete_target_node(name)
     output = rpc.get_target_nodes()
@@ -329,8 +379,7 @@ def verify_target_nodes_rpc_methods(rpc_py, rpc_param):
     verify(not jsonvalues, 1,
            "get_target_nodes returned {}, expected empty".format(jsonvalues))
 
-    rpc.construct_target_node(rpc_param['target_name'], rpc_param['alias_name'], lun_mapping, net_mapping, rpc_param['queue_depth'],
-                              rpc_param['chap_disable'], rpc_param['chap_mutal'], rpc_param['chap_required'], rpc_param['chap_auth_group'])
+    rpc.construct_target_node(rpc_param['target_name'], rpc_param['alias_name'], lun_mapping, net_mapping, rpc_param['queue_depth'], '-d')
 
     rpc.delete_portal_group(portal_tag)
     rpc.delete_initiator_group(initiator_tag)
@@ -342,6 +391,7 @@ def verify_target_nodes_rpc_methods(rpc_py, rpc_param):
 
     print "verify_target_nodes_rpc_methods passed."
 
+
 def verify_get_interfaces(rpc_py):
     rpc = spdk_rpc(rpc_py)
     nics = json.loads(rpc.get_interfaces())
@@ -351,6 +401,7 @@ def verify_get_interfaces(rpc_py):
     verify(nics_names == ifcfg_nics, 1, "get_interfaces returned {}".format(nics))
     print "verify_get_interfaces passed."
 
+
 def help_get_interface_ip_list(rpc_py, nic_name):
     rpc = spdk_rpc(rpc_py)
     nics = json.loads(rpc.get_interfaces())
@@ -359,11 +410,12 @@ def help_get_interface_ip_list(rpc_py, nic_name):
            "Nic name: {} is not found in {}".format(nic_name, [x["name"] for x in nics]))
     return nic[0]["ip_addr"]
 
+
 def verify_add_delete_ip_address(rpc_py):
     rpc = spdk_rpc(rpc_py)
     nics = json.loads(rpc.get_interfaces())
-    # add ip on all nic
-    for x in nics:
+    # add ip on up to first 2 nics
+    for x in nics[:2]:
         faked_ip = "123.123.{}.{}".format(random.randint(1, 254), random.randint(1, 254))
         rpc.add_ip_address(x["ifc_index"], faked_ip)
         verify(faked_ip in help_get_interface_ip_list(rpc_py, x["name"]), 1,
@@ -393,13 +445,14 @@ def verify_add_delete_ip_address(rpc_py):
                    (faked_ip, x["name"]))
     print "verify_add_delete_ip_address passed."
 
+
 def verify_add_nvme_bdev_rpc_methods(rpc_py):
     rpc = spdk_rpc(rpc_py)
     test_pass = 0
     output = check_output(["lspci", "-mm", "-nn"])
     addrs = re.findall('^([0-9]{2}:[0-9]{2}.[0-9]) "Non-Volatile memory controller \[0108\]".*-p02', output, re.MULTILINE)
     for addr in addrs:
-        ctrlr_address = "0000:{}".format(addr)
+        ctrlr_address = "-b Nvme0 -t pcie -a 0000:{}".format(addr)
         rpc.construct_nvme_bdev(ctrlr_address)
         print "add nvme device passed first time"
         test_pass = 0
@@ -414,6 +467,7 @@ def verify_add_nvme_bdev_rpc_methods(rpc_py):
         verify(test_pass == 1, 1, "add nvme device passed second time")
     print "verify_add_nvme_bdev_rpc_methods passed."
 
+
 if __name__ == "__main__":
 
     rpc_py = sys.argv[1]
@@ -422,7 +476,7 @@ if __name__ == "__main__":
         verify_trace_flag_rpc_methods(rpc_py, rpc_param)
         verify_get_interfaces(rpc_py)
         verify_add_delete_ip_address(rpc_py)
-        verify_luns_rpc_methods(rpc_py, rpc_param)
+        create_malloc_bdevs_rpc_methods(rpc_py, rpc_param)
         verify_portal_groups_rpc_methods(rpc_py, rpc_param)
         verify_initiator_groups_rpc_methods(rpc_py, rpc_param)
         verify_target_nodes_rpc_methods(rpc_py, rpc_param)

@@ -38,21 +38,23 @@
 #ifndef SPDK_NET_H
 #define SPDK_NET_H
 
-#include <stddef.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <unistd.h>
-#include <sys/uio.h>
+#include "spdk/stdinc.h"
 
 #include "spdk/queue.h"
 
-#define IDLE_INTERVAL_TIME_IN_US 5000
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+struct spdk_sock;
+
+int spdk_interface_init(void);
+void spdk_interface_destroy(void);
 
 const char *spdk_net_framework_get_name(void);
 int spdk_net_framework_start(void);
-void spdk_net_framework_clear_socket_association(int sock);
-int spdk_net_framework_fini(void);
-int spdk_net_framework_idle_time(void);
+void spdk_net_framework_clear_socket_association(struct spdk_sock *sock);
+void spdk_net_framework_fini(void);
 
 #define SPDK_IFNAMSIZE		32
 #define SPDK_MAX_IP_PER_IFC	32
@@ -69,19 +71,8 @@ int spdk_interface_add_ip_address(int ifc_index, char *ip_addr);
 int spdk_interface_delete_ip_address(int ifc_index, char *ip_addr);
 void *spdk_interface_get_list(void);
 
-int spdk_sock_getaddr(int sock, char *saddr, int slen, char *caddr, int clen);
-int spdk_sock_connect(const char *ip, int port);
-int spdk_sock_listen(const char *ip, int port);
-int spdk_sock_accept(int sock);
-int spdk_sock_close(int sock);
-ssize_t spdk_sock_recv(int sock, void *buf, size_t len);
-ssize_t spdk_sock_writev(int sock, struct iovec *iov, int iovcnt);
+#ifdef __cplusplus
+}
+#endif
 
-int spdk_sock_set_recvlowat(int sock, int nbytes);
-int spdk_sock_set_recvbuf(int sock, int sz);
-int spdk_sock_set_sendbuf(int sock, int sz);
-
-bool spdk_sock_is_ipv6(int sock);
-bool spdk_sock_is_ipv4(int sock);
-
-#endif /* SPDK_NET_FRAMEWORK_H */
+#endif /* SPDK_NET_H */

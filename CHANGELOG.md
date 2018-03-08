@@ -1,8 +1,403 @@
-Changelog
-=========
+# Changelog
 
-v16.12: NVMe over Fabrics host, hotplug, and multi-process
-----------------------------------------------------------
+## v18.04: (Upcoming Release)
+
+### RPC
+
+The Rpc configuration file section, which was deprecated in v18.01, has been removed.
+Users should switch to the `-r` command-line parameter instead.
+
+The JSON-RPC server implementation now allows up to 32 megabyte responses, growing as
+needed; previously, the response was limited to 32 kilobytes.
+
+### NVMe Driver
+
+EXPERIMENTAL: Adds support for WDS and RDS capable CMBs in NVMe controllers. This support is
+experimental pending a functional allocator to free and reallocate CMB buffers.
+
+### NVMe-oF Target
+
+Namespaces may now be assigned unique identifiers via new optional "eui64" and "nguid" parameters
+to the `nvmf_subsystem_add_ns` RPC method.
+
+### Blobstore
+
+A number of functions have been renamed:
+
+- spdk_bs_io_write_blob() => spdk_blob_io_write()
+- spdk_bs_io_read_blob() => spdk_blob_io_read()
+- spdk_bs_io_writev_blob() => spdk_blob_io_writev()
+- spdk_bs_io_readv_blob() => spdk_blob_io_readv()
+- spdk_bs_io_unmap_blob() => spdk_blob_io_unmap()
+- spdk_bs_io_write_zeroes_blob() => spdk_blob_io_write_zeroes()
+
+The old names still exist but are deprecated.  They will be removed in the v18.07 release.
+
+## v18.01: Blobstore Thin Provisioning
+
+### Build System
+
+The build system now includes a `make install` rule, including support for the common
+`DESTDIR` and `prefix` variables as used in other build systems.  Additionally, the prefix
+may be set via the configure `--prefix` option.  Example: `make install prefix=/usr`.
+
+### RPC
+
+A JSON RPC listener is now enabled by default using a UNIX domain socket at /var/run/spdk.sock.
+A -r option command line option has been added to enable an alternative UNIX domain socket location,
+or a TCP port in the format ip_addr:tcp_port (i.e. 127.0.0.1:5260).  The Rpc configuration file
+section is now deprecated and will be removed in the v18.04 release.
+
+### I/O Channels
+
+spdk_poller_register() and spdk_poller_unregister() were moved from the event
+framework (include/spdk/event.h) to the I/O channel library
+(include/spdk/io_channel.h). This allows code that doesn't depend on the event
+framework to request registration and unregistration of pollers.
+
+spdk_for_each_channel() now allows asynchronous operations during iteration.
+Instead of immediately continuing the interation upon returning from the iteration
+callback, the user must call spdk_for_each_channel_continue() to resume iteration.
+
+### Block Device Abstraction Layer (bdev)
+
+The poller abstraction was removed from the bdev layer. There is now a general purpose
+abstraction for pollers available in include/spdk/io_channel.h
+
+### Lib
+
+A set of changes were made in the SPDK's lib code altering,
+instances of calls to `exit()` and `abort()` to return a failure instead
+wherever reasonably possible.  This has resulted in return type changes of
+the API for:
+
+- spdk_env_init() from type `void` to `int`.
+- spdk_mem_map_init() from type `void` to `int`.
+
+Applications making use of these APIs should be modified to check for
+a non-zero return value instead of relying on them to fail without return.
+
+### NVMe Driver
+
+SPDK now supports hotplug for vfio-attached devices. But there is one thing keep in mind:
+Only physical removal events are supported; removing devices via the sysfs `remove` file will not work.
+
+### NVMe-oF Target
+
+Subsystems are no longer tied explicitly to CPU cores. Instead, connections are handed out to the available
+cores round-robin. The "Core" option in the configuration file has been removed.
+
+### Blobstore
+
+A number of functions have been renamed:
+
+- spdk_bs_md_resize_blob() => spdk_blob_resize()
+- spdk_bs_md_sync_blob() => spdk_blob_sync_md()
+- spdk_bs_md_close_blob() => spdk_blob_close()
+- spdk_bs_md_get_xattr_names() => spdk_blob_get_xattr_names()
+- spdk_bs_md_get_xattr_value() => spdk_blob_get_xattr_value()
+- spdk_blob_md_set_xattr() => spdk_blob_set_xattr()
+- spdk_blob_md_remove_xattr() => spdk_blob_remove_xattr()
+- spdk_bs_md_create_blob() => spdk_bs_create_blob()
+- spdk_bs_md_open_blob() => spdk_bs_open_blob()
+- spdk_bs_md_delete_blob() => spdk_bs_delete_blob()
+- spdk_bs_md_iter_first() => spdk_bs_iter_first()
+- spdk_bs_md_iter_next() => spdk_bs_iter_next()
+
+The function signature of spdk_blob_close() has changed.  It now takes a struct spdk_blob * argument
+rather than struct spdk_blob **.
+
+The function signature of spdk_bs_iter_next() has changed.  It now takes a struct spdk_blob * argument
+rather than struct spdk_blob **.
+
+Thin provisioning support has been added to the blobstore.  It can be enabled by setting the
+`thin_provision` flag in struct spdk_blob_opts when calling spdk_bs_create_blob_ext().
+
+### NBD device
+
+The NBD application (test/lib/bdev/nbd) has been removed; Same functionality can now be
+achieved by using the test/app/bdev_svc application and start_nbd_disk RPC method.
+See the [GPT](http://www.spdk.io/doc/bdev.html#bdev_config_gpt) documentation for more details.
+
+### FIO plugin
+
+SPDK `fio_plugin` now suports FIO 3.3. The support for previous FIO 2.21 has been dropped,
+although it still remains to work for now. The new FIO contains huge amount of bugfixes and
+it's recommended to do an update.
+
+### Virtio library
+
+Previously a part of the bdev_virtio module, now a separate library. Virtio is now available
+via `spdk_internal/virtio.h` file. This is an internal interface to be used when implementing
+new Virtio backends, namely Virtio-BLK.
+
+### iSCSI
+
+The MinConnectionIdleInterval parameter has been removed, and connections are no longer migrated
+to an epoll/kqueue descriptor on the master core when idle.
+
+## v17.10: Logical Volumes
+
+### New dependencies
+
+libuuid was added as new dependency for logical volumes.
+
+libnuma is now required unconditionally now that the DPDK submodule has been updated to DPDK 17.08.
+
+### Block Device Abstraction Layer (bdev)
+
+An [fio](http://github.com/axboe/fio) plugin was added that can route
+I/O to the bdev layer. See the [plugin documentation](https://github.com/spdk/spdk/tree/master/examples/bdev/fio_plugin/)
+for more information.
+
+spdk_bdev_unmap() was modified to take an offset and a length in bytes as
+arguments instead of requiring the user to provide an array of SCSI
+unmap descriptors. This limits unmaps to a single contiguous range.
+
+spdk_bdev_write_zeroes() was introduced.  It ensures that all specified blocks will be zeroed out.
+If a block device doesn't natively support a write zeroes command, the bdev layer emulates it using
+write commands.
+
+New API functions that accept I/O parameters in units of blocks instead of bytes
+have been added:
+- spdk_bdev_read_blocks(), spdk_bdev_readv_blocks()
+- spdk_bdev_write_blocks(), spdk_bdev_writev_blocks()
+- spdk_bdev_write_zeroes_blocks()
+- spdk_bdev_unmap_blocks()
+
+The bdev layer now handles temporary out-of-memory I/O failures internally by queueing the I/O to be
+retried later.
+
+### Linux AIO bdev
+
+The AIO bdev now allows the user to override the auto-detected block size.
+
+### NVMe driver
+
+The NVMe driver now recognizes the NVMe 1.3 Namespace Optimal I/O Boundary field.
+NVMe 1.3 devices may report an optimal I/O boundary, which the driver will take
+into account when splitting I/O requests.
+
+The HotplugEnable option in `[Nvme]` sections of the configuration file is now
+"No" by default. It was previously "Yes".
+
+The NVMe library now includes a spdk_nvme_ns_get_ctrlr() function which returns the
+NVMe Controller associated with a given namespace.
+
+The NVMe library now allows the user to specify a host identifier when attaching
+to a controller.  The host identifier is used as part of the Reservations feature,
+as well as in the NVMe-oF Connect command.  The default host ID is also now a
+randomly-generated UUID, and the default host NQN uses the host ID to generate
+a UUID-based NQN.
+
+spdk_nvme_connect() was added to allow the user to connect directly to a single
+NVMe or NVMe-oF controller.
+
+### NVMe-oF Target (nvmf_tgt)
+
+The NVMe-oF target no longer requires any in-capsule data buffers to run, and
+the feature is now entirely optional. Previously, at least 4 KiB in-capsule
+data buffers were required.
+
+NVMe-oF subsytems have a new configuration option, AllowAnyHost, to control
+whether the host NQN whitelist is enforced when accepting new connections.
+If no Host options have been specified and AllowAnyHost is disabled, the
+connection will be denied; this is a behavior change from previous releases,
+which allowed any host NQN to connect if the Host list was empty.
+AllowAnyHost is disabled by default.
+
+NVMe-oF namespaces may now be assigned arbitrary namespace IDs, and the number
+of namespaces per subsystem is no longer limited.
+
+The NVMe-oF target now supports the Write Zeroes command.
+
+### Environment Abstraction Layer
+
+A new default value, SPDK_MEMPOOL_DEFAULT_CACHE_SIZE, was added to provide
+additional clarity when constructing spdk_mempools. Previously, -1 could be
+passed and the library would choose a reasonable default, but this new value
+makes it explicit that the default is being used.
+
+### Blobstore
+
+The blobstore super block now contains a bstype field to identify the type of the blobstore.
+Existing code should be updated to fill out bstype when calling spdk_bs_init() and spdk_bs_load().
+
+spdk_bs_destroy() was added to allow destroying blobstore on device
+with an initialized blobstore.
+
+spdk_bs_io_readv_blob() and spdk_bs_io_writev_blob() were added to enable
+scattered payloads.
+
+A CLI tool for blobstore has been added, allowing basic operations through either command
+line or shell interface.  See the [blobcli](https://github.com/spdk/spdk/tree/master/examples/blob/cli)
+documentation for more details.
+
+### Event Framework
+
+The ability to set a thread name, previously only used by the reactor code, is
+now part of the spdk_thread_allocate() API.  Users may specify a thread name
+which will show up in tools like `gdb`.
+
+### Log
+
+The spdk_trace_dump() function now takes a new parameter to allow the caller to
+specify an output file handle (stdout or stderr, for example).
+
+### Logical Volumes
+
+Logical volumes library built on top of SPDK blobstore has been added.
+It is possible to create logical volumes on top of other devices using RPC.
+
+See the [logical volumes](http://www.spdk.io/doc/logical_volumes.html) documentation for more information.
+
+### Persistent Memory
+
+A new persistent memory bdev type has been added.
+The persistent memory block device is built on top of [libpmemblk](http://pmem.io/nvml/libpmemblk/).
+It is possible to create pmem devices on top of pmem pool files using RPC.
+
+See the [Pmem Block Device](http://www.spdk.io/doc/bdev.html#bdev_config_pmem) documentation for more information.
+
+### Virtio SCSI driver
+
+A userspace driver for Virtio SCSI devices has been added.
+The driver is capable of creating block devices on top of LUNs exposed by another SPDK vhost-scsi application.
+
+See the [Virtio SCSI](http://www.spdk.io/doc/virtio.html) documentation and [Getting Started](http://www.spdk.io/doc/bdev.html#bdev_config_virtio_scsi) guide for more information.
+
+### Vhost target
+
+The vhost target application now supports live migration between QEMU instances.
+
+
+## v17.07: Build system improvements, userspace vhost-blk target, and GPT bdev
+
+### Build System
+
+A `configure` script has been added to simplify the build configuration process.
+The existing CONFIG file and `make CONFIG_...` options are also still supported.
+Run `./configure --help` for information about available configuration options.
+
+A DPDK submodule has been added to make building SPDK easier.  If no `--with-dpdk`
+option is specified to configure, the SPDK build system will automatically build a
+known-good configuration of DPDK with the minimal options enabled.  See the Building
+section of README.md for more information.
+
+A [Vagrant](https://www.vagrantup.com/) setup has been added to make it easier to
+develop and use SPDK on systems without suitable NVMe hardware.  See the Vagrant
+section of README.md for more information.
+
+### Userspace vhost-blk target
+
+The vhost library and example app have been updated to support the vhost-blk
+protocol in addition to the existing vhost-scsi protocol.
+See the [vhost documentation](http://www.spdk.io/doc/vhost.html) for more details.
+
+### Block device abstraction layer (bdev)
+
+A GPT virtual block device has been added, which automatically exposes GPT partitions
+with a special SPDK-specific partition type as bdevs.
+See the [GPT bdev documentation](http://www.spdk.io/doc/bdev.md#bdev_config_gpt) for
+more information.
+
+### NVMe driver
+
+The NVMe driver has been updated to support recent Intel SSDs, including the Intel®
+Optane™ SSD DC P4800X series.
+
+A workaround has been added for devices that failed to recognize register writes
+during controller reset.
+
+The NVMe driver now allocates request tracking objects on a per-queue basis.  The
+number of requests allowed on an I/O queue may be set during `spdk_nvme_probe()` by
+modifying `io_queue_requests` in the opts structure.
+
+The SPDK NVMe `fio_plugin` has been updated to support multiple threads (`numjobs`).
+
+spdk_nvme_ctrlr_alloc_io_qpair() has been modified to allow the user to override
+controller-level options for each individual I/O queue pair.
+Existing callers with qprio == 0 can be updated to:
+~~~
+... = spdk_nvme_ctrlr_alloc_io_qpair(ctrlr, NULL, 0);
+~~~
+Callers that need to specify a non-default qprio should be updated to:
+~~~
+struct spdk_nvme_io_qpair_opts opts;
+spdk_nvme_ctrlr_get_default_io_qpair_opts(ctrlr, &opts, sizeof(opts));
+opts.qprio = SPDK_NVME_QPRIO_...;
+... = spdk_nvme_ctrlr_alloc_io_qpair(ctrlr, &opts, sizeof(opts));
+~~~
+
+### Environment Abstraction Layer
+
+The environment abstraction layer has been updated to include several new functions
+in order to wrap additional DPDK functionality. See `include/spdk/env.h` for the
+current set of functions.
+
+### SPDK Performance Analysis with Intel® VTune™ Amplifier
+
+Support for SPDK performance analysis has been added to Intel® VTune™ Amplifier 2018.
+
+This analysis provides:
+- I/O performance monitoring (calculating standard I/O metrics like IOPS, throughput, etc.)
+- Tuning insights on the interplay of I/O and compute devices by estimating how many cores
+  would be reasonable to provide for SPDK to keep up with a current storage workload.
+
+See the VTune Amplifier documentation for more information.
+
+
+## v17.03: Blobstore and userspace vhost-scsi target
+
+### Blobstore and BlobFS
+
+The blobstore is a persistent, power-fail safe block allocator designed to be
+used as the local storage system backing a higher-level storage service.
+See the [blobstore documentation](http://www.spdk.io/doc/blob.html) for more details.
+
+BlobFS adds basic filesystem functionality like filenames on top of the blobstore.
+This release also includes a RocksDB Env implementation using BlobFS in place of the
+kernel filesystem.
+See the [BlobFS documentation](http://www.spdk.io/doc/blobfs.html) for more details.
+
+### Userspace vhost-scsi target
+
+A userspace implementation of the QEMU vhost-scsi protocol has been added.
+The vhost target is capable of exporting SPDK bdevs to QEMU-based VMs as virtio devices.
+See the [vhost documentation](http://www.spdk.io/doc/vhost.html) for more details.
+
+### Event framework
+
+The overhead of the main reactor event loop was reduced by optimizing the number of
+calls to spdk_get_ticks() per iteration.
+
+### NVMe library
+
+The NVMe library will now automatically split readv/writev requests with scatter-gather
+lists that do not map to valid PRP lists when the NVMe controller does not natively
+support SGLs.
+
+The `identify` and `perf` NVMe examples were modified to add a consistent format for
+specifying remote NVMe over Fabrics devices via the `-r` option.
+This is implemented using the new `spdk_nvme_transport_id_parse()` function.
+
+### iSCSI Target
+
+The [Nvme] section of the configuration file was modified to remove the `BDF` directive
+and replace it with a `TransportID` directive. Both local (PCIe) and remote (NVMe-oF)
+devices can now be specified as the backing block device. A script to generate an
+entire [Nvme] section based on the local NVMe devices attached was added at
+`scripts/gen_nvme.sh`.
+
+### NVMe-oF Target
+
+The [Nvme] section of the configuration file was modified to remove the `BDF` directive
+and replace it with a `TransportID` directive. Both local (PCIe) and remote (NVMe-oF)
+devices can now be specified as the backing block device. A script to generate an
+entire [Nvme] section based on the local NVMe devices attached was added at
+`scripts/gen_nvme.sh`.
+
+## v16.12: NVMe over Fabrics host, hotplug, and multi-process
 
 ### NVMe library
 
@@ -73,7 +468,7 @@ by the NVMe library.
 The `env` environment abstraction library has been introduced, and a default
 DPDK-based implementation is provided as part of SPDK.  The goal of the `env`
 layer is to enable use of alternate user-mode memory allocation and PCI access
-libraries.  See `PORTING.md` for more details.
+libraries.  See `doc/porting.md` for more details.
 
 The build process has been modified to produce all of the library files in the
 `build/lib` directory.  This is intended to simplify the use of SPDK from external
@@ -88,8 +483,7 @@ mechanisms; it should only be enabled on systems with controlled user access
 behind a firewall. An example RPC client implemented in Python is provided in
 `scripts/rpc.py`.
 
-v16.08: iSCSI target, NVMe over Fabrics maturity
-------------------------------------------------
+## v16.08: iSCSI target, NVMe over Fabrics maturity
 
 This release adds a userspace iSCSI target. The iSCSI target is capable of exporting
 NVMe devices over a network using the iSCSI protocol. The application is located
@@ -123,8 +517,7 @@ for the NVMe driver.
     the NVMe library API; see `examples/nvme/hello_world/hello_world.c`.
   - A test for measuring software overhead was added. See `test/lib/nvme/overhead`.
 
-v16.06: NVMf userspace target
------------------------------
+## v16.06: NVMf userspace target
 
 This release adds a userspace NVMf (NVMe over Fabrics) target, conforming to the
 newly-released NVMf 1.0/NVMe 1.2.1 specification.  The NVMf target exports NVMe
@@ -175,8 +568,7 @@ user code.
   - The PCI library API was made more generic to abstract away differences
   between the underlying PCI access implementations.
 
-v1.2.0: IOAT user-space driver
-------------------------------
+## v1.2.0: IOAT user-space driver
 
 This release adds a user-space driver with support for the Intel I/O Acceleration Technology (I/OAT, also known as "Crystal Beach") DMA offload engine.
 
@@ -193,8 +585,7 @@ This release adds a user-space driver with support for the Intel I/O Acceleratio
 - Updated to support DPDK 2.2.0
 
 
-v1.0.0: NVMe user-space driver
-------------------------------
+## v1.0.0: NVMe user-space driver
 
 This is the initial open source release of the Storage Performance Development Kit (SPDK).
 

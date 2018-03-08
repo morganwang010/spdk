@@ -31,53 +31,43 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "spdk/event.h"
+#include "spdk/stdinc.h"
 
-#include <assert.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <sys/mman.h>
-#include <sys/resource.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
-#include <errno.h>
-#include <string.h>
-#include <fcntl.h>
-#include <signal.h>
+#include "spdk_internal/event.h"
 
-#include <rte_config.h>
-#include <rte_lcore.h>
-
+#include "spdk/env.h"
 #include "spdk/log.h"
 #include "spdk/conf.h"
 #include "spdk/trace.h"
+#include "spdk/string.h"
 
-#include "reactor.h"
-#include "subsystem.h"
+#define SPDK_APP_DEFAULT_LOG_PRIORITY	SPDK_LOG_INFO
 
-/* Add enough here to append ".pid" plus 2 digit instance ID */
-#define SPDK_APP_PIDFILE_MAX_LENGTH	40
-#define SPDK_APP_PIDFILE_PREFIX		"/var/run"
+#define SPDK_APP_DPDK_DEFAULT_MEM_SIZE		-1
+#define SPDK_APP_DPDK_DEFAULT_MASTER_CORE	-1
+#define SPDK_APP_DPDK_DEFAULT_MEM_CHANNEL	-1
+#define SPDK_APP_DPDK_DEFAULT_CORE_MASK		"0x1"
 
 struct spdk_app {
 	struct spdk_conf		*config;
-	char				pidfile[SPDK_APP_PIDFILE_MAX_LENGTH];
-	int				instance_id;
+	int				shm_id;
 	spdk_app_shutdown_cb		shutdown_cb;
 	int				rc;
 };
 
 static struct spdk_app g_spdk_app;
-static spdk_event_t g_shutdown_event = NULL;
+static struct spdk_event *g_shutdown_event = NULL;
+static int g_init_lcore;
+static bool g_shutdown_sig_received = false;
 
-static int spdk_app_write_pidfile(void);
-static void spdk_app_remove_pidfile(void);
+static spdk_event_fn g_app_start_fn;
+static void *g_app_start_arg1;
+static void *g_app_start_arg2;
 
 int
-spdk_app_get_instance_id(void)
+spdk_app_get_shm_id(void)
 {
-	return g_spdk_app.instance_id;
+	return g_spdk_app.shm_id;
 }
 
 /* Global section */
@@ -101,27 +91,27 @@ spdk_app_get_instance_id(void)
 "  #  specifying a ReactorMask.  Default is to allow work items to run\n" \
 "  #  on all cores.  Core 0 must be set in the mask if one is specified.\n" \
 "  # Default: 0xFFFF (cores 0-15)\n" \
-"  ReactorMask \"0x%" PRIX64 "\"\n" \
+"  ReactorMask \"0x%s\"\n" \
 "\n" \
 "  # Tracepoint group mask for spdk trace buffers\n" \
 "  # Default: 0x0 (all tracepoint groups disabled)\n" \
 "  # Set to 0xFFFFFFFFFFFFFFFF to enable all tracepoint groups.\n" \
 "  TpointGroupMask \"0x%" PRIX64 "\"\n" \
 "\n" \
-"  # syslog facility\n" \
-"  LogFacility \"%s\"\n" \
-"\n"
 
 static void
 spdk_app_config_dump_global_section(FILE *fp)
 {
-	if (NULL == fp)
-		return;
+	struct spdk_cpuset *coremask;
 
-	/* FIXME - lookup log facility and put it in place of "local7" below */
-	fprintf(fp, GLOBAL_CONFIG_TMPL,
-		spdk_app_get_core_mask(), spdk_trace_get_tpoint_group_mask(),
-		"local7");
+	if (NULL == fp) {
+		return;
+	}
+
+	coremask = spdk_app_get_core_mask();
+
+	fprintf(fp, GLOBAL_CONFIG_TMPL, spdk_cpuset_fmt(coremask),
+		spdk_trace_get_tpoint_group_mask());
 }
 
 int
@@ -137,12 +127,12 @@ spdk_app_get_running_config(char **config_str, char *name)
 	/* Create temporary file to hold config */
 	fd = mkstemp(config_template);
 	if (fd == -1) {
-		fprintf(stderr, "mkstemp failed\n");
+		SPDK_ERRLOG("mkstemp failed\n");
 		return -1;
 	}
 	fp = fdopen(fd, "wb+");
 	if (NULL == fp) {
-		fprintf(stderr, "error opening tmpfile fd = %d\n", fd);
+		SPDK_ERRLOG("error opening tmpfile fd = %d\n", fd);
 		return -1;
 	}
 
@@ -156,37 +146,19 @@ spdk_app_get_running_config(char **config_str, char *name)
 
 	*config_str = malloc(length + 1);
 	if (!*config_str) {
-		perror("config_str");
+		SPDK_ERRLOG("out-of-memory for config\n");
 		fclose(fp);
 		return -1;
 	}
 	fseek(fp, 0, SEEK_SET);
 	ret = fread(*config_str, sizeof(char), length, fp);
-	if (ret < length)
-		fprintf(stderr, "%s: warning - short read\n", __func__);
+	if (ret < length) {
+		SPDK_ERRLOG("short read\n");
+	}
 	fclose(fp);
 	(*config_str)[length] = '\0';
 
 	return 0;
-}
-
-static const char *
-spdk_get_log_facility(struct spdk_conf *config)
-{
-	struct spdk_conf_section *sp;
-	const char *logfacility;
-
-	sp = spdk_conf_find_section(config, "Global");
-	if (sp == NULL) {
-		return SPDK_APP_DEFAULT_LOG_FACILITY;
-	}
-
-	logfacility = spdk_conf_section_get_val(sp, "LogFacility");
-	if (logfacility == NULL) {
-		return SPDK_APP_DEFAULT_LOG_FACILITY;
-	}
-
-	return logfacility;
 }
 
 void
@@ -195,17 +167,22 @@ spdk_app_start_shutdown(void)
 	if (g_shutdown_event != NULL) {
 		spdk_event_call(g_shutdown_event);
 		g_shutdown_event = NULL;
+	} else {
+		spdk_app_stop(0);
 	}
 }
 
 static void
 __shutdown_signal(int signo)
 {
-	spdk_app_start_shutdown();
+	if (!g_shutdown_sig_received) {
+		g_shutdown_sig_received = true;
+		spdk_app_start_shutdown();
+	}
 }
 
 static void
-__shutdown_event_cb(spdk_event_t event)
+__shutdown_event_cb(void *arg1, void *arg2)
 {
 	g_spdk_app.shutdown_cb();
 }
@@ -213,173 +190,213 @@ __shutdown_event_cb(spdk_event_t event)
 void
 spdk_app_opts_init(struct spdk_app_opts *opts)
 {
-	if (!opts)
+	if (!opts) {
 		return;
+	}
 
 	memset(opts, 0, sizeof(*opts));
 
 	opts->enable_coredump = true;
-	opts->instance_id = -1;
-	opts->dpdk_mem_size = -1;
-	opts->dpdk_master_core = SPDK_APP_DPDK_DEFAULT_MASTER_CORE;
-	opts->dpdk_mem_channel = SPDK_APP_DPDK_DEFAULT_MEM_CHANNEL;
+	opts->shm_id = -1;
+	opts->mem_size = SPDK_APP_DPDK_DEFAULT_MEM_SIZE;
+	opts->master_core = SPDK_APP_DPDK_DEFAULT_MASTER_CORE;
+	opts->mem_channel = SPDK_APP_DPDK_DEFAULT_MEM_CHANNEL;
 	opts->reactor_mask = NULL;
 	opts->max_delay_us = 0;
+	opts->print_level = SPDK_LOG_NOTICE;
+	opts->rpc_addr = SPDK_DEFAULT_RPC_ADDR;
 }
 
-void
-spdk_app_init(struct spdk_app_opts *opts)
+static int
+spdk_app_setup_signal_handlers(struct spdk_app_opts *opts)
+{
+	struct sigaction	sigact;
+	sigset_t		sigmask;
+	int			rc;
+
+	/* Set up custom shutdown handling if the user requested it. */
+	if (opts->shutdown_cb != NULL) {
+		g_shutdown_event = spdk_event_allocate(spdk_env_get_current_core(),
+						       __shutdown_event_cb,
+						       NULL, NULL);
+	}
+
+	sigemptyset(&sigmask);
+	memset(&sigact, 0, sizeof(sigact));
+	sigemptyset(&sigact.sa_mask);
+
+	sigact.sa_handler = SIG_IGN;
+	rc = sigaction(SIGPIPE, &sigact, NULL);
+	if (rc < 0) {
+		SPDK_ERRLOG("sigaction(SIGPIPE) failed\n");
+		return rc;
+	}
+
+	/* Install the same handler for SIGINT and SIGTERM */
+	sigact.sa_handler = __shutdown_signal;
+
+	rc = sigaction(SIGINT, &sigact, NULL);
+	if (rc < 0) {
+		SPDK_ERRLOG("sigaction(SIGINT) failed\n");
+		return rc;
+	}
+	sigaddset(&sigmask, SIGINT);
+
+	rc = sigaction(SIGTERM, &sigact, NULL);
+	if (rc < 0) {
+		SPDK_ERRLOG("sigaction(SIGTERM) failed\n");
+		return rc;
+	}
+	sigaddset(&sigmask, SIGTERM);
+
+	if (opts->usr1_handler != NULL) {
+		sigact.sa_handler = opts->usr1_handler;
+		rc = sigaction(SIGUSR1, &sigact, NULL);
+		if (rc < 0) {
+			SPDK_ERRLOG("sigaction(SIGUSR1) failed\n");
+			return rc;
+		}
+		sigaddset(&sigmask, SIGUSR1);
+	}
+
+	pthread_sigmask(SIG_UNBLOCK, &sigmask, NULL);
+
+	return 0;
+}
+
+static void
+start_rpc(void *arg1, void *arg2)
+{
+	const char *rpc_addr = arg1;
+
+	spdk_rpc_initialize(rpc_addr);
+	g_app_start_fn(g_app_start_arg1, g_app_start_arg2);
+}
+
+int
+spdk_app_start(struct spdk_app_opts *opts, spdk_event_fn start_fn,
+	       void *arg1, void *arg2)
 {
 	struct spdk_conf		*config;
 	struct spdk_conf_section	*sp;
-	struct sigaction	sigact;
-	sigset_t		signew;
 	char			shm_name[64];
 	int			rc;
 	uint64_t		tpoint_group_mask;
 	char			*end;
+	struct spdk_env_opts env_opts = {};
+	struct spdk_event *app_start_event;
 
+	if (!opts) {
+		SPDK_ERRLOG("opts should not be NULL\n");
+		exit(EXIT_FAILURE);
+	}
+
+	if (opts->print_level > SPDK_LOG_WARN &&
+	    isatty(STDERR_FILENO) &&
+	    !strncmp(ttyname(STDERR_FILENO), "/dev/tty", strlen("/dev/tty"))) {
+		printf("Warning: printing stderr to console terminal without -q option specified.\n");
+		printf("Suggest using -q to disable logging to stderr and monitor syslog, or\n");
+		printf("redirect stderr to a file.\n");
+		printf("(Delaying for 10 seconds...)\n");
+		sleep(10);
+	}
+
+	spdk_log_set_print_level(opts->print_level);
+
+#ifndef SPDK_NO_RLIMIT
 	if (opts->enable_coredump) {
 		struct rlimit core_limits;
 
 		core_limits.rlim_cur = core_limits.rlim_max = RLIM_INFINITY;
 		setrlimit(RLIMIT_CORE, &core_limits);
 	}
+#endif
 
 	config = spdk_conf_allocate();
 	assert(config != NULL);
 	if (opts->config_file) {
 		rc = spdk_conf_read(config, opts->config_file);
 		if (rc != 0) {
-			fprintf(stderr, "Could not read config file %s\n", opts->config_file);
+			SPDK_ERRLOG("Could not read config file %s\n", opts->config_file);
+			spdk_conf_free(config);
 			exit(EXIT_FAILURE);
 		}
 		if (spdk_conf_first_section(config) == NULL) {
-			fprintf(stderr, "Invalid config file %s\n", opts->config_file);
+			SPDK_ERRLOG("Invalid config file %s\n", opts->config_file);
+			spdk_conf_free(config);
 			exit(EXIT_FAILURE);
 		}
 	}
 	spdk_conf_set_as_default(config);
 
-	if (opts->instance_id == -1) {
+	if (opts->shm_id == -1) {
 		sp = spdk_conf_find_section(config, "Global");
 		if (sp != NULL) {
-			opts->instance_id = spdk_conf_section_get_intval(sp, "InstanceID");
+			opts->shm_id = spdk_conf_section_get_intval(sp, "SharedMemoryID");
 		}
-	}
-
-	if (opts->instance_id < 0) {
-		opts->instance_id = 0;
 	}
 
 	memset(&g_spdk_app, 0, sizeof(g_spdk_app));
 	g_spdk_app.config = config;
-	g_spdk_app.instance_id = opts->instance_id;
+	g_spdk_app.shm_id = opts->shm_id;
 	g_spdk_app.shutdown_cb = opts->shutdown_cb;
-	snprintf(g_spdk_app.pidfile, sizeof(g_spdk_app.pidfile), "%s/%s.pid.%d",
-		 SPDK_APP_PIDFILE_PREFIX, opts->name, opts->instance_id);
-	spdk_app_write_pidfile();
 
-	/* open log files */
-	if (opts->log_facility == NULL) {
-		opts->log_facility = spdk_get_log_facility(g_spdk_app.config);
-		if (opts->log_facility == NULL) {
-			fprintf(stderr, "NULL logfacility\n");
-			spdk_conf_free(g_spdk_app.config);
-			exit(EXIT_FAILURE);
-		}
-	}
-	rc = spdk_set_log_facility(opts->log_facility);
-	if (rc < 0) {
-		fprintf(stderr, "log facility error\n");
-		spdk_conf_free(g_spdk_app.config);
-		exit(EXIT_FAILURE);
-	}
+	spdk_log_set_level(SPDK_APP_DEFAULT_LOG_PRIORITY);
+	spdk_log_open();
 
-	rc = spdk_set_log_priority(SPDK_APP_DEFAULT_LOG_PRIORITY);
-	if (rc < 0) {
-		fprintf(stderr, "log priority error\n");
-		spdk_conf_free(g_spdk_app.config);
-		exit(EXIT_FAILURE);
-	}
-	spdk_open_log();
-
+	sp = spdk_conf_find_section(g_spdk_app.config, "Global");
 	if (opts->reactor_mask == NULL) {
-		sp = spdk_conf_find_section(g_spdk_app.config, "Global");
-		if (sp != NULL) {
-			if (spdk_conf_section_get_val(sp, "ReactorMask")) {
-				opts->reactor_mask = spdk_conf_section_get_val(sp, "ReactorMask");
-			} else {
-				opts->reactor_mask = SPDK_APP_DPDK_DEFAULT_CORE_MASK;
-			}
+		if (sp && spdk_conf_section_get_val(sp, "ReactorMask")) {
+			opts->reactor_mask = spdk_conf_section_get_val(sp, "ReactorMask");
 		} else {
 			opts->reactor_mask = SPDK_APP_DPDK_DEFAULT_CORE_MASK;
 		}
 	}
 
-	spdk_dpdk_framework_init(opts);
+	if (!opts->no_pci && sp) {
+		opts->no_pci = spdk_conf_section_get_boolval(sp, "NoPci", false);
+	}
+
+	spdk_env_opts_init(&env_opts);
+
+	env_opts.name = opts->name;
+	env_opts.core_mask = opts->reactor_mask;
+	env_opts.shm_id = opts->shm_id;
+	env_opts.mem_channel = opts->mem_channel;
+	env_opts.master_core = opts->master_core;
+	env_opts.mem_size = opts->mem_size;
+	env_opts.no_pci = opts->no_pci;
+
+	if (spdk_env_init(&env_opts) < 0) {
+		SPDK_ERRLOG("Unable to initialize SPDK env\n");
+		spdk_conf_free(g_spdk_app.config);
+		exit(EXIT_FAILURE);
+	}
+
+	SPDK_NOTICELOG("Total cores available: %d\n", spdk_env_get_core_count());
 
 	/*
 	 * If mask not specified on command line or in configuration file,
 	 *  reactor_mask will be 0x1 which will enable core 0 to run one
 	 *  reactor.
 	 */
-	if (spdk_reactors_init(opts->reactor_mask, opts->max_delay_us)) {
-		fprintf(stderr, "Invalid reactor mask.\n");
+	if (spdk_reactors_init(opts->max_delay_us)) {
+		SPDK_ERRLOG("Invalid reactor mask.\n");
+		spdk_conf_free(g_spdk_app.config);
 		exit(EXIT_FAILURE);
 	}
 
-	/* setup signal handler thread */
-	pthread_sigmask(SIG_SETMASK, NULL, &signew);
-
-	memset(&sigact, 0, sizeof(sigact));
-	sigact.sa_handler = SIG_IGN;
-	sigemptyset(&sigact.sa_mask);
-	rc = sigaction(SIGPIPE, &sigact, NULL);
-	if (rc < 0) {
-		SPDK_ERRLOG("sigaction(SIGPIPE) failed\n");
+	if (spdk_app_setup_signal_handlers(opts)) {
+		spdk_conf_free(g_spdk_app.config);
 		exit(EXIT_FAILURE);
 	}
 
-	if (opts->shutdown_cb != NULL) {
-		g_shutdown_event = spdk_event_allocate(rte_lcore_id(), __shutdown_event_cb,
-						       NULL, NULL, NULL);
-
-		sigact.sa_handler = __shutdown_signal;
-		sigemptyset(&sigact.sa_mask);
-		rc = sigaction(SIGINT, &sigact, NULL);
-		if (rc < 0) {
-			SPDK_ERRLOG("sigaction(SIGINT) failed\n");
-			exit(EXIT_FAILURE);
-		}
-		sigaddset(&signew, SIGINT);
-
-		sigact.sa_handler = __shutdown_signal;
-		sigemptyset(&sigact.sa_mask);
-		rc = sigaction(SIGTERM, &sigact, NULL);
-		if (rc < 0) {
-			SPDK_ERRLOG("sigaction(SIGTERM) failed\n");
-			exit(EXIT_FAILURE);
-		}
-		sigaddset(&signew, SIGTERM);
+	if (opts->shm_id >= 0) {
+		snprintf(shm_name, sizeof(shm_name), "/%s_trace.%d", opts->name, opts->shm_id);
+	} else {
+		snprintf(shm_name, sizeof(shm_name), "/%s_trace.pid%d", opts->name, (int)getpid());
 	}
 
-	if (opts->usr1_handler != NULL) {
-		sigact.sa_handler = opts->usr1_handler;
-		sigemptyset(&sigact.sa_mask);
-		rc = sigaction(SIGUSR1, &sigact, NULL);
-		if (rc < 0) {
-			SPDK_ERRLOG("sigaction(SIGUSR1) failed\n");
-			exit(EXIT_FAILURE);
-		}
-		sigaddset(&signew, SIGUSR1);
-	}
-
-	sigaddset(&signew, SIGQUIT);
-	sigaddset(&signew, SIGHUP);
-	pthread_sigmask(SIG_SETMASK, &signew, NULL);
-
-	snprintf(shm_name, sizeof(shm_name), "/%s_trace.%d", opts->name, opts->instance_id);
 	spdk_trace_init(shm_name);
 
 	if (opts->tpoint_group_mask == NULL) {
@@ -395,42 +412,23 @@ spdk_app_init(struct spdk_app_opts *opts)
 		if (*end != '\0' || errno) {
 			SPDK_ERRLOG("invalid tpoint mask %s\n", opts->tpoint_group_mask);
 		} else {
+			SPDK_NOTICELOG("Tracepoint Group Mask %s specified.\n", opts->tpoint_group_mask);
+			SPDK_NOTICELOG("Use 'spdk_trace -s %s %s %d' to capture a snapshot of events at runtime.\n",
+				       opts->name,
+				       opts->shm_id >= 0 ? "-i" : "-p",
+				       opts->shm_id >= 0 ? opts->shm_id : getpid());
 			spdk_trace_set_tpoint_group_mask(tpoint_group_mask);
 		}
 	}
 
-	rc = spdk_subsystem_init();
-	if (rc < 0) {
-		SPDK_ERRLOG("spdk_subsystem_init() failed\n");
-		exit(EXIT_FAILURE);
-	}
-}
-
-int
-spdk_app_fini(void)
-{
-	int rc;
-
-	rc = spdk_subsystem_fini();
-	spdk_trace_cleanup();
-	spdk_app_remove_pidfile();
-	spdk_conf_free(g_spdk_app.config);
-	spdk_close_log();
-
-	return rc;
-}
-
-int
-spdk_app_start(spdk_event_fn start_fn, void *arg1, void *arg2)
-{
-	spdk_event_t event;
-
 	g_spdk_app.rc = 0;
+	g_init_lcore = spdk_env_get_current_core();
+	g_app_start_fn = start_fn;
+	g_app_start_arg1 = arg1;
+	g_app_start_arg2 = arg2;
+	app_start_event = spdk_event_allocate(g_init_lcore, start_rpc, (void *)opts->rpc_addr, NULL);
 
-	event = spdk_event_allocate(rte_get_master_lcore(), start_fn,
-				    arg1, arg2, NULL);
-	/* Queues up the event, but can't run it until the reactors start */
-	spdk_event_call(event);
+	spdk_subsystem_init(app_start_event);
 
 	/* This blocks until spdk_app_stop is called */
 	spdk_reactors_start();
@@ -439,50 +437,165 @@ spdk_app_start(spdk_event_fn start_fn, void *arg1, void *arg2)
 }
 
 void
-spdk_app_stop(int rc)
+spdk_app_fini(void)
 {
-	spdk_reactors_stop();
-	g_spdk_app.rc = rc;
-}
-
-static int
-spdk_app_write_pidfile(void)
-{
-	FILE *fp;
-	pid_t pid;
-	struct flock lock = {
-		.l_type = F_WRLCK,
-		.l_whence = SEEK_SET,
-		.l_start = 0,
-		.l_len = 0,
-	};
-
-	fp = fopen(g_spdk_app.pidfile, "w");
-	if (fp == NULL) {
-		SPDK_ERRLOG("pidfile open error %d\n", errno);
-		return -1;
-	}
-
-	if (fcntl(fileno(fp), F_SETLK, &lock) != 0) {
-		fprintf(stderr, "Cannot create lock on file %s, probably you"
-			" should use different instance id\n", g_spdk_app.pidfile);
-		exit(EXIT_FAILURE);
-	}
-
-	pid = getpid();
-	fprintf(fp, "%d\n", (int)pid);
-	fclose(fp);
-	return 0;
+	spdk_trace_cleanup();
+	spdk_reactors_fini();
+	spdk_conf_free(g_spdk_app.config);
+	spdk_log_close();
 }
 
 static void
-spdk_app_remove_pidfile(void)
+_spdk_app_stop(void *arg1, void *arg2)
 {
-	int rc;
+	struct spdk_event *app_stop_event;
 
-	rc = remove(g_spdk_app.pidfile);
-	if (rc != 0) {
-		SPDK_ERRLOG("pidfile remove error %d\n", errno);
-		/* ignore error */
+	spdk_rpc_finish();
+
+	app_stop_event = spdk_event_allocate(spdk_env_get_current_core(), spdk_reactors_stop, NULL, NULL);
+	spdk_subsystem_fini(app_stop_event);
+}
+
+void
+spdk_app_stop(int rc)
+{
+	g_spdk_app.rc = rc;
+	/*
+	 * We want to run spdk_subsystem_fini() from the same lcore where spdk_subsystem_init()
+	 * was called.
+	 */
+	spdk_event_call(spdk_event_allocate(g_init_lcore, _spdk_app_stop, NULL, NULL));
+}
+
+static void
+usage(char *executable_name, struct spdk_app_opts *default_opts, void (*app_usage)(void))
+{
+	printf("%s [options]\n", executable_name);
+	printf("options:\n");
+	printf(" -c config  config file (default %s)\n", default_opts->config_file);
+	printf(" -d         disable coredump file enabling\n");
+	printf(" -e mask    tracepoint group mask for spdk trace buffers (default 0x0)\n");
+	printf(" -h         show this usage\n");
+	printf(" -i shared memory ID (optional)\n");
+	printf(" -m mask    core mask for DPDK\n");
+	printf(" -n channel number of memory channels used for DPDK\n");
+	printf(" -p core    master (primary) core for DPDK\n");
+	printf(" -q         disable notice level logging to stderr\n");
+	printf(" -r         RPC listen address (default %s)\n", SPDK_DEFAULT_RPC_ADDR);
+	printf(" -s size    memory size in MB for DPDK (default: ");
+	if (default_opts->mem_size > 0) {
+		printf("%dMB)\n", default_opts->mem_size);
+	} else {
+		printf("all hugepage memory)\n");
 	}
+	spdk_tracelog_usage(stdout, "-t");
+	app_usage();
+}
+
+int
+spdk_app_parse_args(int argc, char **argv, struct spdk_app_opts *opts,
+		    const char *app_getopt_str, void (*app_parse)(int ch, char *arg),
+		    void (*app_usage)(void))
+{
+	int ch, rc;
+	struct spdk_app_opts default_opts;
+	char *getopt_str;
+
+	memcpy(&default_opts, opts, sizeof(default_opts));
+
+	if (opts->config_file && access(opts->config_file, F_OK) != 0) {
+		opts->config_file = NULL;
+	}
+
+	getopt_str = spdk_sprintf_alloc("%s%s", app_getopt_str, SPDK_APP_GETOPT_STRING);
+	if (getopt_str == NULL) {
+		fprintf(stderr, "Could not allocate getopt_str in %s()\n", __func__);
+		exit(EXIT_FAILURE);
+	}
+
+	while ((ch = getopt(argc, argv, getopt_str)) != -1) {
+		switch (ch) {
+		case 'c':
+			opts->config_file = optarg;
+			break;
+		case 'd':
+			opts->enable_coredump = false;
+			break;
+		case 'e':
+			opts->tpoint_group_mask = optarg;
+			break;
+		case 'h':
+			usage(argv[0], &default_opts, app_usage);
+			exit(EXIT_SUCCESS);
+		case 'i':
+			opts->shm_id = atoi(optarg);
+			break;
+		case 'm':
+			opts->reactor_mask = optarg;
+			break;
+		case 'n':
+			opts->mem_channel = atoi(optarg);
+			break;
+		case 'p':
+			opts->master_core = atoi(optarg);
+			break;
+		case 'q':
+			opts->print_level = SPDK_LOG_WARN;
+			break;
+		case 'r':
+			opts->rpc_addr = optarg;
+			break;
+		case 's': {
+			uint64_t mem_size_mb;
+			bool mem_size_has_prefix;
+
+			rc = spdk_parse_capacity(optarg, &mem_size_mb, &mem_size_has_prefix);
+			if (rc != 0) {
+				fprintf(stderr, "invalid memory pool size `-s %s`\n", optarg);
+				usage(argv[0], &default_opts, app_usage);
+				exit(EXIT_FAILURE);
+			}
+
+			if (mem_size_has_prefix) {
+				/* the mem size is in MB by default, so if a prefix was
+				 * specified, we need to manually convert to MB.
+				 */
+				mem_size_mb /= 1024 * 1024;
+			}
+
+			if (mem_size_mb > INT_MAX) {
+				fprintf(stderr, "invalid memory pool size `-s %s`\n", optarg);
+				usage(argv[0], &default_opts, app_usage);
+				exit(EXIT_FAILURE);
+			}
+
+			opts->mem_size = (int) mem_size_mb;
+			break;
+		}
+		case 't':
+			rc = spdk_log_set_trace_flag(optarg);
+			if (rc < 0) {
+				fprintf(stderr, "unknown flag\n");
+				usage(argv[0], &default_opts, app_usage);
+				exit(EXIT_FAILURE);
+			}
+			opts->print_level = SPDK_LOG_DEBUG;
+#ifndef DEBUG
+			fprintf(stderr, "%s must be built with CONFIG_DEBUG=y for -t flag\n",
+				argv[0]);
+			usage(argv[0], &default_opts, app_usage);
+			exit(EXIT_FAILURE);
+#endif
+			break;
+		case '?':
+			usage(argv[0], &default_opts, app_usage);
+			exit(EXIT_FAILURE);
+		default:
+			app_parse(ch, optarg);
+		}
+	}
+
+	free(getopt_str);
+
+	return 0;
 }

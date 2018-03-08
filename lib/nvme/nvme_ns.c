@@ -63,8 +63,8 @@ int nvme_ns_identify_update(struct spdk_nvme_ns *ns)
 		/* This can occur if the namespace is not active. Simply zero the
 		 * namespace data and continue. */
 		memset(nsdata, 0, sizeof(*nsdata));
-		ns->stripe_size = 0;
 		ns->sector_size = 0;
+		ns->extended_lba_size = 0;
 		ns->md_size = 0;
 		ns->pi_type = 0;
 		ns->sectors_per_max_io = 0;
@@ -73,12 +73,32 @@ int nvme_ns_identify_update(struct spdk_nvme_ns *ns)
 		return 0;
 	}
 
-	ns->sector_size = 1 << nsdata->lbaf[nsdata->flbas.format].lbads;
-
-	ns->sectors_per_max_io = spdk_nvme_ns_get_max_io_xfer_size(ns) / ns->sector_size;
-	ns->sectors_per_stripe = ns->stripe_size / ns->sector_size;
-
 	ns->flags = 0x0000;
+
+	ns->sector_size = 1 << nsdata->lbaf[nsdata->flbas.format].lbads;
+	ns->extended_lba_size = ns->sector_size;
+
+	ns->md_size = nsdata->lbaf[nsdata->flbas.format].ms;
+	if (nsdata->flbas.extended) {
+		ns->flags |= SPDK_NVME_NS_EXTENDED_LBA_SUPPORTED;
+		ns->extended_lba_size += ns->md_size;
+	}
+
+	ns->sectors_per_max_io = spdk_nvme_ns_get_max_io_xfer_size(ns) / ns->extended_lba_size;
+
+	if (nsdata->noiob) {
+		ns->sectors_per_stripe = nsdata->noiob;
+		SPDK_DEBUGLOG(SPDK_LOG_NVME, "ns %u optimal IO boundary %" PRIu32 " blocks\n",
+			      ns->id, ns->sectors_per_stripe);
+	} else if (ns->ctrlr->quirks & NVME_INTEL_QUIRK_STRIPING &&
+		   ns->ctrlr->cdata.vs[3] != 0) {
+		ns->sectors_per_stripe = (1ULL << ns->ctrlr->cdata.vs[3]) * ns->ctrlr->min_page_size /
+					 ns->sector_size;
+		SPDK_DEBUGLOG(SPDK_LOG_NVME, "ns %u stripe size quirk %" PRIu32 " blocks\n",
+			      ns->id, ns->sectors_per_stripe);
+	} else {
+		ns->sectors_per_stripe = 0;
+	}
 
 	if (ns->ctrlr->cdata.oncs.dsm) {
 		ns->flags |= SPDK_NVME_NS_DEALLOCATE_SUPPORTED;
@@ -96,13 +116,10 @@ int nvme_ns_identify_update(struct spdk_nvme_ns *ns)
 		ns->flags |= SPDK_NVME_NS_RESERVATION_SUPPORTED;
 	}
 
-	ns->md_size = nsdata->lbaf[nsdata->flbas.format].ms;
 	ns->pi_type = SPDK_NVME_FMT_NVM_PROTECTION_DISABLE;
 	if (nsdata->lbaf[nsdata->flbas.format].ms && nsdata->dps.pit) {
 		ns->flags |= SPDK_NVME_NS_DPS_PI_SUPPORTED;
 		ns->pi_type = nsdata->dps.pit;
-		if (nsdata->flbas.extended)
-			ns->flags |= SPDK_NVME_NS_EXTENDED_LBA_SUPPORTED;
 	}
 	return rc;
 }
@@ -124,6 +141,12 @@ spdk_nvme_ns_is_active(struct spdk_nvme_ns *ns)
 	 * Check NCAP since it must be nonzero for an active namespace.
 	 */
 	return nsdata->ncap != 0;
+}
+
+struct spdk_nvme_ctrlr *
+spdk_nvme_ns_get_ctrlr(struct spdk_nvme_ns *ns)
+{
+	return ns->ctrlr;
 }
 
 uint32_t
@@ -180,6 +203,25 @@ spdk_nvme_ns_get_data(struct spdk_nvme_ns *ns)
 	return _nvme_ns_get_data(ns);
 }
 
+enum spdk_nvme_dealloc_logical_block_read_value spdk_nvme_ns_get_dealloc_logical_block_read_value(
+	struct spdk_nvme_ns *ns)
+{
+	struct spdk_nvme_ctrlr *ctrlr = ns->ctrlr;
+	const struct spdk_nvme_ns_data *data = spdk_nvme_ns_get_data(ns);
+
+	if (ctrlr->quirks & NVME_QUIRK_READ_ZERO_AFTER_DEALLOCATE) {
+		return SPDK_NVME_DEALLOC_READ_00;
+	} else {
+		return data->dlfeat.bits.read_value;
+	}
+}
+
+uint32_t
+spdk_nvme_ns_get_optimal_io_boundary(struct spdk_nvme_ns *ns)
+{
+	return ns->sectors_per_stripe;
+}
+
 int nvme_ns_construct(struct spdk_nvme_ns *ns, uint16_t id,
 		      struct spdk_nvme_ctrlr *ctrlr)
 {
@@ -187,12 +229,6 @@ int nvme_ns_construct(struct spdk_nvme_ns *ns, uint16_t id,
 
 	ns->ctrlr = ctrlr;
 	ns->id = id;
-	ns->stripe_size = 0;
-
-	if (ctrlr->quirks & NVME_INTEL_QUIRK_STRIPING &&
-	    ctrlr->cdata.vs[3] != 0) {
-		ns->stripe_size = (1 << ctrlr->cdata.vs[3]) * ctrlr->min_page_size;
-	}
 
 	return nvme_ns_identify_update(ns);
 }

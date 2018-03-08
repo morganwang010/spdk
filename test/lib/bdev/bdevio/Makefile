@@ -40,9 +40,8 @@ APP = bdevio
 
 C_SRCS := bdevio.c
 
-CFLAGS += -I. $(ENV_CFLAGS)
-
-SPDK_LIB_LIST = bdev copy event trace log conf util rpc jsonrpc json
+SPDK_LIB_LIST = event_bdev event_copy
+SPDK_LIB_LIST += bdev copy event trace log conf util rpc jsonrpc json
 
 LIBS += $(BLOCKDEV_MODULES_LINKER_ARGS) \
 	$(COPY_MODULES_LINKER_ARGS)
@@ -50,6 +49,7 @@ LIBS += $(BLOCKDEV_MODULES_LINKER_ARGS) \
 LIBS += $(SPDK_LIB_LINKER_ARGS) $(ENV_LINKER_ARGS) -lcunit
 
 all : $(APP)
+	@:
 
 $(APP) : $(OBJS) $(SPDK_LIB_FILES) $(BLOCKDEV_MODULES_FILES) $(LINKER_MODULES) $(ENV_LIBS)
 	$(LINK_C)

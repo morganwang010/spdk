@@ -31,21 +31,9 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-#include <rte_config.h>
-#include <rte_eal.h>
+#include "spdk/stdinc.h"
 
 #include "spdk/env.h"
-
-static const char *ealargs[] = {
-	"vtophys",
-	"-c 0x1",
-	"-n 4",
-};
 
 static int
 vtophys_negative_test(void)
@@ -57,8 +45,9 @@ vtophys_negative_test(void)
 
 	for (i = 0; i < 31; i++) {
 		p = malloc(size);
-		if (p == NULL)
+		if (p == NULL) {
 			continue;
+		}
 
 		if (spdk_vtophys(p) != SPDK_VTOPHYS_ERROR) {
 			rc = -1;
@@ -78,10 +67,11 @@ vtophys_negative_test(void)
 		printf("Err: kernel-mode address incorrectly allowed\n");
 	}
 
-	if (!rc)
+	if (!rc) {
 		printf("vtophys_negative_test passed\n");
-	else
+	} else {
 		printf("vtophys_negative_test failed\n");
+	}
 
 	return rc;
 }
@@ -95,47 +85,91 @@ vtophys_positive_test(void)
 	int rc = 0;
 
 	for (i = 0; i < 31; i++) {
-		p = spdk_zmalloc(size, 512, NULL);
-		if (p == NULL)
+		p = spdk_dma_zmalloc(size, 512, NULL);
+		if (p == NULL) {
 			continue;
+		}
 
 		if (spdk_vtophys(p) == SPDK_VTOPHYS_ERROR) {
 			rc = -1;
 			printf("Err: VA=%p is not mapped to a huge_page,\n", p);
-			spdk_free(p);
+			spdk_dma_free(p);
 			break;
 		}
 
-		spdk_free(p);
+		spdk_dma_free(p);
 		size = size << 1;
 	}
 
-	if (!rc)
+	if (!rc) {
 		printf("vtophys_positive_test passed\n");
-	else
+	} else {
 		printf("vtophys_positive_test failed\n");
+	}
 
 	return rc;
+}
+
+static int
+test_map_notify(void *cb_ctx, struct spdk_mem_map *map,
+		enum spdk_mem_map_notify_action action,
+		void *vaddr, size_t size)
+{
+	const char *action_str = "unknown";
+
+	switch (action) {
+	case SPDK_MEM_MAP_NOTIFY_REGISTER:
+		action_str = "register";
+		break;
+	case SPDK_MEM_MAP_NOTIFY_UNREGISTER:
+		action_str = "unregister";
+		break;
+	}
+
+	printf("%s: %s %p-%p (%zu bytes)\n", __func__, action_str, vaddr, vaddr + size - 1, size);
+	return 0;
+}
+
+static int
+mem_map_test(void)
+{
+	struct spdk_mem_map *map;
+	uint64_t default_translation = 0xDEADBEEF0BADF00D;
+
+	map = spdk_mem_map_alloc(default_translation, test_map_notify, NULL);
+	if (map == NULL) {
+		return 1;
+	}
+
+	spdk_mem_map_free(&map);
+	return 0;
 }
 
 
 int
 main(int argc, char **argv)
 {
-	int rc;
+	int			rc;
+	struct spdk_env_opts	opts;
 
-	rc = rte_eal_init(sizeof(ealargs) / sizeof(ealargs[0]),
-			  (char **)(void *)(uintptr_t)ealargs);
-
-	if (rc < 0) {
-		fprintf(stderr, "Could not init eal\n");
-		exit(1);
+	spdk_env_opts_init(&opts);
+	opts.name = "vtophys";
+	opts.core_mask = "0x1";
+	if (spdk_env_init(&opts) < 0) {
+		printf("Err: Unable to initialize SPDK env\n");
+		return 1;
 	}
 
 	rc = vtophys_negative_test();
-	if (rc < 0)
+	if (rc < 0) {
 		return rc;
+	}
 
 	rc = vtophys_positive_test();
+	if (rc < 0) {
+		return rc;
+	}
+
+	rc = mem_map_test();
 	return rc;
 }

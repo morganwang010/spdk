@@ -31,25 +31,20 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "spdk/stdinc.h"
+
 #include "spdk/bit_array.h"
 #include "spdk/env.h"
 
-#include <assert.h>
-#include <errno.h>
-#include <limits.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdlib.h>
-#include <string.h>
-
 #include "spdk/likely.h"
+#include "spdk/util.h"
 
 typedef uint64_t spdk_bit_array_word;
 #define SPDK_BIT_ARRAY_WORD_TZCNT(x)	(__builtin_ctzll(x))
 #define SPDK_BIT_ARRAY_WORD_C(x)	((spdk_bit_array_word)(x))
 #define SPDK_BIT_ARRAY_WORD_BYTES	sizeof(spdk_bit_array_word)
 #define SPDK_BIT_ARRAY_WORD_BITS	(SPDK_BIT_ARRAY_WORD_BYTES * 8)
-#define SPDK_BIT_ARRAY_WORD_INDEX_SHIFT	(31u - __builtin_clz(SPDK_BIT_ARRAY_WORD_BITS))
+#define SPDK_BIT_ARRAY_WORD_INDEX_SHIFT	spdk_u32log2(SPDK_BIT_ARRAY_WORD_BITS)
 #define SPDK_BIT_ARRAY_WORD_INDEX_MASK	((1u << SPDK_BIT_ARRAY_WORD_INDEX_SHIFT) - 1)
 
 struct spdk_bit_array {
@@ -78,7 +73,7 @@ spdk_bit_array_free(struct spdk_bit_array **bap)
 
 	ba = *bap;
 	*bap = NULL;
-	spdk_free(ba);
+	spdk_dma_free(ba);
 }
 
 static inline uint32_t
@@ -114,7 +109,7 @@ spdk_bit_array_resize(struct spdk_bit_array **bap, uint32_t num_bits)
 	 */
 	new_size += SPDK_BIT_ARRAY_WORD_BYTES;
 
-	new_ba = (struct spdk_bit_array *)spdk_realloc(*bap, new_size, 64, NULL);
+	new_ba = (struct spdk_bit_array *)spdk_dma_realloc(*bap, new_size, 64, NULL);
 	if (!new_ba) {
 		return -ENOMEM;
 	}

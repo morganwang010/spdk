@@ -3,11 +3,11 @@
 set -xe
 
 testdir=$(readlink -f $(dirname $0))
-rootdir="$testdir/../../.."
-source $rootdir/scripts/autotest_common.sh
+rootdir=$(readlink -f $testdir/../../..)
+source $rootdir/test/common/autotest_common.sh
 
 function ssh_vm() {
-	sshpass -p "$password" ssh -o PubkeyAuthentication=no -p 10022 root@localhost "$@"
+	sshpass -p "$password" ssh -o PubkeyAuthentication=no -o StrictHostKeyChecking=no -p 10022 root@localhost "$@"
 }
 
 function monitor_cmd() {
@@ -18,6 +18,19 @@ function monitor_cmd() {
 	fi
 	rm mon.log
 	return $rc
+}
+
+function get_online_devices_count() {
+	ssh_vm "lspci | grep -c NVM"
+}
+
+function wait_for_devices_ready() {
+	count=$(get_online_devices_count)
+
+	while [ $count -ne 4 ]; do
+		echo "waitting for all devices online"
+		count=$(get_online_devices_count)
+	done
 }
 
 function devices_initialization() {
@@ -38,6 +51,7 @@ function insert_devices() {
 	monitor_cmd "device_add nvme,drive=drive1,id=nvme1,serial=nvme1"
 	monitor_cmd "device_add nvme,drive=drive2,id=nvme2,serial=nvme2"
 	monitor_cmd "device_add nvme,drive=drive3,id=nvme3,serial=nvme3"
+	wait_for_devices_ready
 	ssh_vm "scripts/setup.sh"
 }
 
@@ -74,7 +88,7 @@ timing_enter start_qemu
 qemu-img create -b "$base_img" -f qcow2 "$test_img"
 
 qemu-system-x86_64 \
-	-daemonize -display none -m 1024 \
+	-daemonize -display none -m 8192 \
 	-pidfile "$qemu_pidfile" \
 	-hda "$test_img" \
 	-net user,hostfwd=tcp::10022-:22 \
@@ -100,14 +114,14 @@ insert_devices
 
 timing_enter hotplug_test
 
-ssh_vm "examples/nvme/hotplug/hotplug -t 10 -i 4 -r 8" &
+ssh_vm "examples/nvme/hotplug/hotplug -i 0 -t 25 -n 4 -r 8" &
 example_pid=$!
 
-sleep 2
+sleep 4
 remove_devices
-sleep 2
+sleep 4
 insert_devices
-sleep 2
+sleep 4
 remove_devices
 devices_delete
 
@@ -122,6 +136,7 @@ kill -9 $qemupid
 rm "$qemu_pidfile"
 rm "$test_img"
 
+report_test_completion "nvme_hotplug"
 timing_exit hotplug_test
 
 timing_exit hotplug

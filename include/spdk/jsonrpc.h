@@ -39,16 +39,13 @@
 #ifndef SPDK_JSONRPC_H_
 #define SPDK_JSONRPC_H_
 
+#include "spdk/stdinc.h"
+
 #include "spdk/json.h"
 
-#include <stdlib.h>
-#include <inttypes.h>
-#include <stdbool.h>
-#include <stddef.h>
-
-#include <sys/ioctl.h>
-#include <sys/types.h>
-#include <sys/socket.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #define SPDK_JSONRPC_ERROR_PARSE_ERROR		-32700
 #define SPDK_JSONRPC_ERROR_INVALID_REQUEST	-32600
@@ -57,7 +54,7 @@
 #define SPDK_JSONRPC_ERROR_INTERNAL_ERROR	-32603
 
 struct spdk_jsonrpc_server;
-struct spdk_jsonrpc_server_conn;
+struct spdk_jsonrpc_request;
 
 /**
  * User callback to handle a single JSON-RPC request.
@@ -66,10 +63,9 @@ struct spdk_jsonrpc_server_conn;
  *  spdk_jsonrpc_send_error_response().
  */
 typedef void (*spdk_jsonrpc_handle_request_fn)(
-	struct spdk_jsonrpc_server_conn *conn,
+	struct spdk_jsonrpc_request *request,
 	const struct spdk_json_val *method,
-	const struct spdk_json_val *params,
-	const struct spdk_json_val *id);
+	const struct spdk_json_val *params);
 
 struct spdk_jsonrpc_server *spdk_jsonrpc_server_listen(int domain, int protocol,
 		struct sockaddr *listen_addr, socklen_t addrlen, spdk_jsonrpc_handle_request_fn handle_request);
@@ -78,11 +74,55 @@ int spdk_jsonrpc_server_poll(struct spdk_jsonrpc_server *server);
 
 void spdk_jsonrpc_server_shutdown(struct spdk_jsonrpc_server *server);
 
-struct spdk_json_write_ctx *spdk_jsonrpc_begin_result(struct spdk_jsonrpc_server_conn *conn,
-		const struct spdk_json_val *id);
-void spdk_jsonrpc_end_result(struct spdk_jsonrpc_server_conn *conn, struct spdk_json_write_ctx *w);
+/**
+ * Begin building a response to a JSON-RPC request.
+ *
+ * \param request JSON-RPC request to respond to.
+ * \return JSON write context to write the response object to, or NULL if no response is necessary.
+ *
+ * If this function returns non-NULL, the user must call spdk_jsonrpc_end_result() on the request
+ * after writing the desired response object to the spdk_json_write_ctx.
+ */
+struct spdk_json_write_ctx *spdk_jsonrpc_begin_result(struct spdk_jsonrpc_request *request);
 
-void spdk_jsonrpc_send_error_response(struct spdk_jsonrpc_server_conn *conn,
-				      const struct spdk_json_val *id, int error_code, const char *msg);
+/**
+ * Complete and send a JSON-RPC response.
+ *
+ * \param request Request to complete the response for.
+ * \param w JSON write context returned from spdk_jsonrpc_begin_result().
+ */
+void spdk_jsonrpc_end_result(struct spdk_jsonrpc_request *request, struct spdk_json_write_ctx *w);
+
+/**
+ * Send an error response to a JSON-RPC request.
+ *
+ * \param request JSON-RPC request to respond to.
+ * \param error_code Integer error code to return (may be one of the SPDK_JSONRPC_ERROR_ errors,
+ *                   or a custom error code).
+ * \param msg String error message to return.
+ *
+ * This is shorthand for spdk_jsonrpc_begin_result() + spdk_jsonrpc_end_result() with an error
+ * object.
+ */
+void spdk_jsonrpc_send_error_response(struct spdk_jsonrpc_request *request,
+				      int error_code, const char *msg);
+
+/**
+ * Send an error response to a JSON-RPC request.
+ *
+ * \param request JSON-RPC request to respond to.
+ * \param error_code Integer error code to return (may be one of the SPDK_JSONRPC_ERROR_ errors,
+ *                   or a custom error code).
+ * \param fmt Printf-like format string.
+ *
+ * This is shorthand for printf() + spdk_jsonrpc_send_error_response().
+ */
+void spdk_jsonrpc_send_error_response_fmt(struct spdk_jsonrpc_request *request,
+		int error_code, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

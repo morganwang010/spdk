@@ -31,10 +31,7 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <assert.h>
-#include <stdio.h>
-#include <errno.h>
-#include <pthread.h>
+#include "spdk/stdinc.h"
 
 #include "spdk_internal/copy_engine.h"
 
@@ -109,7 +106,7 @@ struct ioat_task {
 };
 
 static int copy_engine_ioat_init(void);
-static void copy_engine_ioat_exit(void);
+static void copy_engine_ioat_exit(void *ctx);
 
 static size_t
 copy_engine_ioat_get_ctx_size(void)
@@ -121,7 +118,7 @@ SPDK_COPY_MODULE_REGISTER(copy_engine_ioat_init, copy_engine_ioat_exit, NULL,
 			  copy_engine_ioat_get_ctx_size)
 
 static void
-copy_engine_ioat_exit(void)
+copy_engine_ioat_exit(void *ctx)
 {
 	struct ioat_device *dev;
 
@@ -130,9 +127,9 @@ copy_engine_ioat_exit(void)
 		TAILQ_REMOVE(&g_devices, dev, tailq);
 		spdk_ioat_detach(dev->ioat);
 		ioat_free_device(dev);
-		spdk_free(dev);
+		spdk_dma_free(dev);
 	}
-	return;
+	spdk_copy_engine_module_finish();
 }
 
 static void
@@ -148,7 +145,7 @@ ioat_done(void *cb_arg)
 	ioat_task->cb(copy_req, 0);
 }
 
-static int64_t
+static int
 ioat_copy_submit(void *cb_arg, struct spdk_io_channel *ch, void *dst, void *src, uint64_t nbytes,
 		 spdk_copy_completion_cb cb)
 {
@@ -162,7 +159,7 @@ ioat_copy_submit(void *cb_arg, struct spdk_io_channel *ch, void *dst, void *src,
 	return spdk_ioat_submit_copy(ioat_ch->ioat_ch, ioat_task, ioat_done, dst, src, nbytes);
 }
 
-static int64_t
+static int
 ioat_copy_submit_fill(void *cb_arg, struct spdk_io_channel *ch, void *dst, uint8_t fill,
 		      uint64_t nbytes, spdk_copy_completion_cb cb)
 {
@@ -185,7 +182,7 @@ ioat_poll(void *arg)
 	spdk_ioat_process_events(chan);
 }
 
-static struct spdk_io_channel *ioat_get_io_channel(uint32_t priority);
+static struct spdk_io_channel *ioat_get_io_channel(void);
 
 static struct spdk_copy_engine ioat_copy_engine = {
 	.copy		= ioat_copy_submit,
@@ -194,7 +191,7 @@ static struct spdk_copy_engine ioat_copy_engine = {
 };
 
 static int
-ioat_create_cb(void *io_device, uint32_t priority, void *ctx_buf, void *unique_ctx)
+ioat_create_cb(void *io_device, void *ctx_buf)
 {
 	struct ioat_io_channel *ch = ctx_buf;
 	struct ioat_device *ioat_dev;
@@ -206,8 +203,7 @@ ioat_create_cb(void *io_device, uint32_t priority, void *ctx_buf, void *unique_c
 
 	ch->ioat_dev = ioat_dev;
 	ch->ioat_ch = ioat_dev->ioat;
-	spdk_poller_register(&ch->poller, ioat_poll, ch->ioat_ch,
-			     spdk_app_get_current_core(), NULL, 0);
+	ch->poller = spdk_poller_register(ioat_poll, ch->ioat_ch, 0);
 	return 0;
 }
 
@@ -217,13 +213,13 @@ ioat_destroy_cb(void *io_device, void *ctx_buf)
 	struct ioat_io_channel *ch = ctx_buf;
 
 	ioat_free_device(ch->ioat_dev);
-	spdk_poller_unregister(&ch->poller, NULL);
+	spdk_poller_unregister(&ch->poller);
 }
 
 static struct spdk_io_channel *
-ioat_get_io_channel(uint32_t priority)
+ioat_get_io_channel(void)
 {
-	return spdk_get_io_channel(&ioat_copy_engine, priority, false, NULL);
+	return spdk_get_io_channel(&ioat_copy_engine);
 }
 
 struct ioat_probe_ctx {
@@ -237,7 +233,8 @@ probe_cb(void *cb_ctx, struct spdk_pci_device *pci_dev)
 	struct ioat_probe_ctx *ctx = cb_ctx;
 	struct spdk_pci_addr pci_addr = spdk_pci_device_get_addr(pci_dev);
 
-	SPDK_NOTICELOG(" Found matching device at %d:%d:%d vendor:0x%04x device:0x%04x\n",
+	SPDK_NOTICELOG(" Found matching device at %04x:%02x:%02x.%x vendor:0x%04x device:0x%04x\n",
+		       pci_addr.domain,
 		       pci_addr.bus,
 		       pci_addr.dev,
 		       pci_addr.func,
@@ -250,7 +247,7 @@ probe_cb(void *cb_ctx, struct spdk_pci_device *pci_dev)
 	}
 
 	/* Claim the device in case conflict with other process */
-	if (spdk_pci_device_claim(&pci_addr) != 0) {
+	if (spdk_pci_device_claim(&pci_addr) < 0) {
 		return false;
 	}
 
@@ -262,7 +259,7 @@ attach_cb(void *cb_ctx, struct spdk_pci_device *pci_dev, struct spdk_ioat_chan *
 {
 	struct ioat_device *dev;
 
-	dev = spdk_zmalloc(sizeof(*dev), 0, NULL);
+	dev = spdk_dma_zmalloc(sizeof(*dev), 0, NULL);
 	if (dev == NULL) {
 		SPDK_ERRLOG("Failed to allocate device struct\n");
 		return;
@@ -276,23 +273,22 @@ static int
 copy_engine_ioat_init(void)
 {
 	struct spdk_conf_section *sp = spdk_conf_find_section(NULL, "Ioat");
-	const char *val, *pci_bdf;
+	const char *pci_bdf;
 	int i;
 	struct ioat_probe_ctx probe_ctx = {};
 
 	if (sp != NULL) {
-		val = spdk_conf_section_get_val(sp, "Disable");
-		if (val != NULL) {
+		if (spdk_conf_section_get_boolval(sp, "Disable", false)) {
 			/* Disable Ioat */
-			if (!strcmp(val, "Yes")) {
-				return 0;
-			}
+			return 0;
 		}
-		/*Init the whitelist*/
+
+		/* Init the whitelist */
 		for (i = 0; i < IOAT_MAX_CHANNELS; i++) {
 			pci_bdf = spdk_conf_section_get_nmval(sp, "Whitelist", i, 0);
-			if (!pci_bdf)
+			if (!pci_bdf) {
 				break;
+			}
 
 			if (spdk_pci_addr_parse(&probe_ctx.whitelist[probe_ctx.num_whitelist_devices], pci_bdf) < 0) {
 				SPDK_ERRLOG("Invalid Ioat Whitelist address %s\n", pci_bdf);

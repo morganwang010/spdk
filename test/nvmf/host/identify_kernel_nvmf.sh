@@ -2,12 +2,14 @@
 
 testdir=$(readlink -f $(dirname $0))
 rootdir=$(readlink -f $testdir/../../..)
-source $rootdir/scripts/autotest_common.sh
+source $rootdir/test/common/autotest_common.sh
 source $rootdir/test/nvmf/common.sh
 
 set -e
 
-if ! rdma_nic_available; then
+RDMA_IP_LIST=$(get_available_rdma_ips)
+NVMF_FIRST_TARGET_IP=$(echo "$RDMA_IP_LIST" | head -n 1)
+if [ -z $NVMF_FIRST_TARGET_IP ]; then
 	echo "no NIC for nvmf test"
 	exit 0
 fi
@@ -43,7 +45,14 @@ echo -n $NVMF_PORT > /sys/kernel/config/nvmet/ports/1/addr_trsvcid
 
 ln -s /sys/kernel/config/nvmet/subsystems/$subsystemname /sys/kernel/config/nvmet/ports/1/subsystems/$subsystemname
 
-$rootdir/examples/nvme/identify/identify -a "$NVMF_FIRST_TARGET_IP" -s "$NVMF_PORT" -n nqn.2014-08.org.nvmexpress.discovery -t all
+sleep 4
+
+$rootdir/examples/nvme/identify/identify -r "\
+	trtype:RDMA \
+	adrfam:IPv4 \
+	traddr:$NVMF_FIRST_TARGET_IP \
+	trsvcid:$NVMF_PORT \
+	subnqn:nqn.2014-08.org.nvmexpress.discovery" -t all
 
 rm -rf /sys/kernel/config/nvmet/ports/1/subsystems/$subsystemname
 

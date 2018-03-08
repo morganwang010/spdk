@@ -39,43 +39,75 @@
 #ifndef SPDK_LOG_H
 #define SPDK_LOG_H
 
-#include <stdbool.h>
-#include <stdint.h>
-#include <stddef.h>
-#include <stdio.h>
+#include "spdk/stdinc.h"
 
-/*
- * Default: 1 - noticelog messages will print to stderr and syslog.
- * Can be set to 0 to print noticelog messages to syslog only.
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Initialize the logging module. Messages prior
+ * to this call will be dropped.
  */
-extern unsigned int spdk_g_notice_stderr_flag;
+void spdk_log_open(void);
+
+/**
+ * Close the currently active log. Messages after this call
+ * will be dropped.
+ */
+void spdk_log_close(void);
+
+enum spdk_log_level {
+	SPDK_LOG_ERROR,
+	SPDK_LOG_WARN,
+	SPDK_LOG_NOTICE,
+	SPDK_LOG_INFO,
+	SPDK_LOG_DEBUG,
+};
+
+/**
+ * Set the threshold to log messages. Messages with a higher
+ * level than this are ignored.
+ */
+void spdk_log_set_level(enum spdk_log_level level);
+
+/**
+ * Get the current log threshold.
+ */
+enum spdk_log_level spdk_log_get_level(void);
+
+/**
+ * Set the current log level threshold for printing to stderr.
+ * Messages with a level less than or equal to this level
+ * are also printed to stderr.
+ */
+void spdk_log_set_print_level(enum spdk_log_level level);
+
+/**
+ * Get the current log level print threshold.
+ */
+enum spdk_log_level spdk_log_get_print_level(void);
 
 #define SPDK_NOTICELOG(...) \
-	spdk_noticelog(NULL, 0, NULL, __VA_ARGS__)
+	spdk_log(SPDK_LOG_NOTICE, __FILE__, __LINE__, __func__, __VA_ARGS__)
 #define SPDK_WARNLOG(...) \
-	spdk_warnlog(NULL, 0, NULL, __VA_ARGS__)
+	spdk_log(SPDK_LOG_WARN, __FILE__, __LINE__, __func__, __VA_ARGS__)
 #define SPDK_ERRLOG(...) \
-	spdk_errlog(__FILE__, __LINE__, __func__, __VA_ARGS__)
+	spdk_log(SPDK_LOG_ERROR, __FILE__, __LINE__, __func__, __VA_ARGS__)
 
-int spdk_set_log_facility(const char *facility);
-int spdk_set_log_priority(const char *priority);
-void spdk_noticelog(const char *file, const int line, const char *func,
-		    const char *format, ...) __attribute__((__format__(__printf__, 4, 5)));
-void spdk_warnlog(const char *file, const int line, const char *func,
-		  const char *format, ...) __attribute__((__format__(__printf__, 4, 5)));
-void spdk_tracelog(const char *flag, const char *file, const int line,
-		   const char *func, const char *format, ...) __attribute__((__format__(__printf__, 5, 6)));
-void spdk_errlog(const char *file, const int line, const char *func,
-		 const char *format, ...) __attribute__((__format__(__printf__, 4, 5)));
-void spdk_trace_dump(const char *label, const uint8_t *buf, size_t len);
+void spdk_log(enum spdk_log_level level, const char *file, const int line, const char *func,
+	      const char *format, ...) __attribute__((__format__(__printf__, 5, 6)));
+
+void spdk_trace_dump(FILE *fp, const char *label, const void *buf, size_t len);
 
 bool spdk_log_get_trace_flag(const char *flag);
 int spdk_log_set_trace_flag(const char *flag);
 int spdk_log_clear_trace_flag(const char *flag);
 
-void spdk_open_log(void);
-void spdk_close_log(void);
-
 void spdk_tracelog_usage(FILE *f, const char *trace_arg);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* SPDK_LOG_H */

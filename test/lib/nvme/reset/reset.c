@@ -31,14 +31,7 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <stdio.h>
-#include <stdbool.h>
-#include <string.h>
-#include <unistd.h>
-
-#include <rte_config.h>
-#include <rte_mempool.h>
-#include <rte_lcore.h>
+#include "spdk/stdinc.h"
 
 #include "spdk/nvme.h"
 #include "spdk/env.h"
@@ -78,11 +71,11 @@ struct reset_task {
 };
 
 struct worker_thread {
-	struct ns_worker_ctx 	*ns_ctx;
+	struct ns_worker_ctx	*ns_ctx;
 	unsigned		lcore;
 };
 
-static struct rte_mempool *task_pool;
+static struct spdk_mempool *task_pool;
 
 static struct ctrlr_entry *g_controllers = NULL;
 static struct ns_entry *g_namespaces = NULL;
@@ -96,6 +89,8 @@ static int g_rw_percentage;
 static int g_is_random;
 static int g_queue_depth;
 static int g_time_in_sec;
+
+#define  TASK_POOL_NUM 8192
 
 static void
 register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
@@ -133,6 +128,7 @@ static void
 register_ctrlr(struct spdk_nvme_ctrlr *ctrlr)
 {
 	int nsid, num_ns;
+	struct spdk_nvme_ns *ns;
 	struct ctrlr_entry *entry = malloc(sizeof(struct ctrlr_entry));
 
 	if (entry == NULL) {
@@ -146,18 +142,11 @@ register_ctrlr(struct spdk_nvme_ctrlr *ctrlr)
 
 	num_ns = spdk_nvme_ctrlr_get_num_ns(ctrlr);
 	for (nsid = 1; nsid <= num_ns; nsid++) {
-		register_ns(ctrlr, spdk_nvme_ctrlr_get_ns(ctrlr, nsid));
-	}
-}
-
-static void task_ctor(struct rte_mempool *mp, void *arg, void *__task, unsigned id)
-{
-	struct reset_task *task = __task;
-
-	task->buf = spdk_zmalloc(g_io_size_bytes, 0x200, NULL);
-	if (task->buf == NULL) {
-		fprintf(stderr, "task->buf spdk_zmalloc failed\n");
-		exit(1);
+		ns = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
+		if (ns == NULL) {
+			continue;
+		}
+		register_ns(ctrlr, ns);
 	}
 }
 
@@ -173,8 +162,16 @@ submit_single_io(struct ns_worker_ctx *ns_ctx)
 	int			rc;
 	struct ns_entry		*entry = ns_ctx->entry;
 
-	if (rte_mempool_get(task_pool, (void **)&task) != 0) {
-		fprintf(stderr, "task_pool rte_mempool_get failed\n");
+	task = spdk_mempool_get(task_pool);
+	if (!task) {
+		fprintf(stderr, "Failed to get task from task_pool\n");
+		exit(1);
+	}
+
+	task->buf = spdk_dma_zmalloc(g_io_size_bytes, 0x200, NULL);
+	if (!task->buf) {
+		spdk_dma_free(task->buf);
+		fprintf(stderr, "task->buf spdk_dma_zmalloc failed\n");
 		exit(1);
 	}
 
@@ -222,7 +219,8 @@ task_complete(struct reset_task *task, const struct spdk_nvme_cpl *completion)
 		ns_ctx->io_completed++;
 	}
 
-	rte_mempool_put(task_pool, task);
+	spdk_dma_free(task->buf);
+	spdk_mempool_put(task_pool, task);
 
 	/*
 	 * is_draining indicates when time has expired for the test run
@@ -277,7 +275,7 @@ work_fn(void *arg)
 	/* Submit initial I/O for each namespace. */
 	ns_ctx = worker->ns_ctx;
 	while (ns_ctx != NULL) {
-		ns_ctx->qpair = spdk_nvme_ctrlr_alloc_io_qpair(ns_ctx->entry->ctrlr, 0);
+		ns_ctx->qpair = spdk_nvme_ctrlr_alloc_io_qpair(ns_ctx->entry->ctrlr, NULL, 0);
 		if (ns_ctx->qpair == NULL) {
 			fprintf(stderr, "spdk_nvme_ctrlr_alloc_io_qpair() failed on core %u\n", worker->lcore);
 			return -1;
@@ -385,7 +383,7 @@ parse_args(int argc, char **argv)
 	int op;
 	bool mix_specified = false;
 
-	/* default value*/
+	/* default value */
 	g_queue_depth = 0;
 	g_io_size_bytes = 0;
 	workload_type = NULL;
@@ -483,7 +481,6 @@ parse_args(int argc, char **argv)
 		g_is_random = 1;
 	}
 
-	optind = 1;
 	return 0;
 }
 
@@ -499,7 +496,7 @@ register_workers(void)
 	}
 
 	memset(worker, 0, sizeof(struct worker_thread));
-	worker->lcore = rte_get_master_lcore();
+	worker->lcore = spdk_env_get_current_core();
 
 	g_workers = worker;
 
@@ -526,7 +523,7 @@ register_controllers(void)
 {
 	printf("Initializing NVMe Controllers\n");
 
-	if (spdk_nvme_probe(NULL, probe_cb, attach_cb, NULL) != 0) {
+	if (spdk_nvme_probe(NULL, NULL, probe_cb, attach_cb, NULL) != 0) {
 		fprintf(stderr, "spdk_nvme_probe() failed\n");
 		return 1;
 	}
@@ -612,33 +609,43 @@ run_nvme_reset_cycle(int retry_count)
 	return 0;
 }
 
-static char *ealargs[] = {
-	"reset",
-	"-c 0x1",
-	"-n 4",
-};
+static void
+spdk_reset_free_tasks(void)
+{
+	if (spdk_mempool_count(task_pool) != TASK_POOL_NUM) {
+		fprintf(stderr, "task_pool count is %zu but should be %d\n",
+			spdk_mempool_count(task_pool), TASK_POOL_NUM);
+	}
+	spdk_mempool_free(task_pool);
+}
 
 int main(int argc, char **argv)
 {
-	int rc;
-	int i;
+	int			rc;
+	int			i;
+	struct spdk_env_opts	opts;
+
 
 	rc = parse_args(argc, argv);
 	if (rc != 0) {
 		return rc;
 	}
 
-	rc = rte_eal_init(sizeof(ealargs) / sizeof(ealargs[0]), ealargs);
-
-	if (rc < 0) {
-		fprintf(stderr, "could not initialize dpdk\n");
+	spdk_env_opts_init(&opts);
+	opts.name = "reset";
+	opts.core_mask = "0x1";
+	if (spdk_env_init(&opts) < 0) {
+		fprintf(stderr, "Unable to initialize SPDK env\n");
 		return 1;
 	}
 
-	task_pool = rte_mempool_create("task_pool", 8192,
-				       sizeof(struct reset_task),
-				       64, 0, NULL, NULL, task_ctor, NULL,
-				       SOCKET_ID_ANY, 0);
+	task_pool = spdk_mempool_create("task_pool", TASK_POOL_NUM,
+					sizeof(struct reset_task),
+					64, SPDK_ENV_SOCKET_ID_ANY);
+	if (!task_pool) {
+		fprintf(stderr, "Cannot create task pool\n");
+		return 1;
+	}
 
 	g_tsc_rate = spdk_get_ticks_hz();
 
@@ -666,6 +673,7 @@ int main(int argc, char **argv)
 
 cleanup:
 	unregister_controllers();
+	spdk_reset_free_tasks();
 
 	if (rc != 0) {
 		fprintf(stderr, "%s: errors occured\n", argv[0]);

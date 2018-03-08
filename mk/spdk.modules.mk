@@ -31,20 +31,28 @@
 #  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-BLOCKDEV_MODULES_LIST = bdev_malloc bdev_nvme nvme
+BLOCKDEV_MODULES_LIST = bdev_malloc bdev_null bdev_nvme nvme vbdev_error vbdev_gpt vbdev_lvol vbdev_split
+
+# Modules below are added as dependency for vbdev_lvol
+BLOCKDEV_MODULES_LIST += blob blob_bdev lvol
 
 ifeq ($(CONFIG_RDMA),y)
 BLOCKDEV_MODULES_DEPS += -libverbs -lrdmacm
 endif
 
 ifeq ($(OS),Linux)
-BLOCKDEV_MODULES_LIST += bdev_aio
+BLOCKDEV_MODULES_LIST += bdev_aio bdev_virtio virtio
 BLOCKDEV_MODULES_DEPS += -laio
 endif
 
 ifeq ($(CONFIG_RBD),y)
 BLOCKDEV_MODULES_LIST += bdev_rbd
 BLOCKDEV_MODULES_DEPS += -lrados -lrbd
+endif
+
+ifeq ($(CONFIG_NVML),y)
+BLOCKDEV_MODULES_LIST += bdev_pmem
+BLOCKDEV_MODULES_DEPS += -lpmemblk
 endif
 
 COPY_MODULES_LIST = copy_ioat ioat

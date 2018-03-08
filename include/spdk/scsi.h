@@ -33,19 +33,19 @@
 
 /**
  * \file
- * SCSI to blockdev translation layer
+ * SCSI to bdev translation layer
  */
 
 #ifndef SPDK_SCSI_H
 #define SPDK_SCSI_H
 
-#include <stdbool.h>
-#include <stdint.h>
-#include <pthread.h>
-#include <sys/uio.h>
+#include "spdk/stdinc.h"
 
 #include "spdk/queue.h"
-#include "spdk/event.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /* Defines for SPDK tracing framework */
 #define OWNER_SCSI_DEV				0x10
@@ -61,8 +61,6 @@
 
 #define SPDK_SCSI_PORT_MAX_NAME_LENGTH		255
 
-#define SPDK_SCSI_LUN_MAX_NAME_LENGTH		16
-
 enum spdk_scsi_data_dir {
 	SPDK_SCSI_DIR_NONE = 0,
 	SPDK_SCSI_DIR_TO_DEV = 1,
@@ -74,11 +72,6 @@ enum spdk_scsi_task_func {
 	SPDK_SCSI_TASK_FUNC_ABORT_TASK_SET,
 	SPDK_SCSI_TASK_FUNC_CLEAR_TASK_SET,
 	SPDK_SCSI_TASK_FUNC_LUN_RESET,
-};
-
-enum spdk_scsi_task_type {
-	SPDK_SCSI_TASK_TYPE_CMD = 0,
-	SPDK_SCSI_TASK_TYPE_MANAGE,
 };
 
 /*
@@ -95,25 +88,25 @@ enum spdk_scsi_task_mgmt_resp {
 	SPDK_SCSI_TASK_MGMT_RESP_REJECT_FUNC_NOT_SUPPORTED
 };
 
+struct spdk_scsi_task;
+typedef void (*spdk_scsi_task_cpl)(struct spdk_scsi_task *task);
+typedef void (*spdk_scsi_task_free)(struct spdk_scsi_task *task);
+
 struct spdk_scsi_task {
-	uint8_t				type;
 	uint8_t				status;
 	uint8_t				function; /* task mgmt function */
 	uint8_t				response; /* task mgmt response */
+
 	struct spdk_scsi_lun		*lun;
-	struct spdk_io_channel		*ch;
 	struct spdk_scsi_port		*target_port;
 	struct spdk_scsi_port		*initiator_port;
-	spdk_event_t			cb_event;
+
+	spdk_scsi_task_cpl		cpl_fn;
+	spdk_scsi_task_free		free_fn;
 
 	uint32_t ref;
-	uint32_t id;
 	uint32_t transfer_len;
-	uint32_t data_out_cnt;
 	uint32_t dxfer_dir;
-	uint32_t desired_data_transfer_length;
-	/* Only valid for Read/Write */
-	uint32_t bytes_completed;
 	uint32_t length;
 
 	/**
@@ -123,9 +116,6 @@ struct spdk_scsi_task {
 	uint32_t data_transferred;
 
 	uint64_t offset;
-	struct spdk_scsi_task *parent;
-
-	void (*free_fn)(struct spdk_scsi_task *);
 
 	uint8_t *cdb;
 
@@ -145,119 +135,75 @@ struct spdk_scsi_task {
 	uint8_t sense_data[32];
 	size_t sense_data_len;
 
-	void *blockdev_io;
+	void *bdev_io;
 
 	TAILQ_ENTRY(spdk_scsi_task) scsi_link;
 
-	/*
-	 * Pointer to scsi task owner's outstanding
-	 * task counter. Inc/Dec by get/put task functions.
-	 * Note: in the future, we could consider replacing this
-	 * with an owner-provided task management fuction that
-	 * could perform protocol specific task mangement
-	 * operations (such as tracking outstanding tasks).
-	 */
-	uint32_t *owner_task_ctr;
-
 	uint32_t abort_id;
-	TAILQ_HEAD(subtask_list, spdk_scsi_task) subtask_list;
 };
 
-struct spdk_scsi_port {
-	struct spdk_scsi_dev	*dev;
-	uint64_t		id;
-	uint16_t		index;
-	char			name[SPDK_SCSI_PORT_MAX_NAME_LENGTH];
-};
+struct spdk_scsi_port;
+struct spdk_scsi_dev;
+struct spdk_scsi_lun;
 
-struct spdk_scsi_dev {
-	int			id;
-	int			is_allocated;
+int spdk_scsi_init(void);
 
-	char			name[SPDK_SCSI_DEV_MAX_NAME];
+void spdk_scsi_fini(void);
 
-	int			maxlun;
-	struct spdk_scsi_lun	*lun[SPDK_SCSI_DEV_MAX_LUN];
+int spdk_scsi_lun_get_id(const struct spdk_scsi_lun *lun);
+const char *spdk_scsi_lun_get_bdev_name(const struct spdk_scsi_lun *lun);
+const struct spdk_scsi_dev *spdk_scsi_lun_get_dev(const struct spdk_scsi_lun *lun);
 
-	int			num_ports;
-	struct spdk_scsi_port	port[SPDK_SCSI_DEV_MAX_PORTS];
-};
-
-/**
-
-\brief Represents a SCSI LUN.
-
-LUN modules will implement the function pointers specifically for the LUN
-type.  For example, NVMe LUNs will implement scsi_execute to translate
-the SCSI task to an NVMe command and post it to the NVMe controller.
-malloc LUNs will implement scsi_execute to translate the SCSI task and
-copy the task's data into or out of the allocated memory buffer.
-
-*/
-struct spdk_scsi_lun {
-	/** LUN id for this logical unit. */
-	int id;
-
-	/** Pointer to the SCSI device containing this LUN. */
-	struct spdk_scsi_dev *dev;
-
-	/** The blockdev associated with this LUN. */
-	struct spdk_bdev *bdev;
-
-	/** I/O channel for the blockdev associated with this LUN. */
-	struct spdk_io_channel *io_channel;
-
-	/** Thread ID for the thread that allocated the I/O channel for this
-	 *   LUN.  All I/O to this LUN must be performed from this thread.
-	 */
-	pthread_t thread_id;
-
-	/** Name for this LUN. */
-	char name[SPDK_SCSI_LUN_MAX_NAME_LENGTH];
-
-	TAILQ_HEAD(tasks, spdk_scsi_task) tasks;			/* submitted tasks */
-	TAILQ_HEAD(pending_tasks, spdk_scsi_task) pending_tasks;	/* pending tasks */
-};
-
+const char *spdk_scsi_dev_get_name(const struct spdk_scsi_dev *dev);
+int spdk_scsi_dev_get_id(const struct spdk_scsi_dev *dev);
+struct spdk_scsi_lun *spdk_scsi_dev_get_lun(struct spdk_scsi_dev *dev, int lun_id);
+bool spdk_scsi_dev_has_pending_tasks(const struct spdk_scsi_dev *dev);
 void spdk_scsi_dev_destruct(struct spdk_scsi_dev *dev);
-void spdk_scsi_dev_queue_mgmt_task(struct spdk_scsi_dev *dev, struct spdk_scsi_task *task);
+void spdk_scsi_dev_queue_mgmt_task(struct spdk_scsi_dev *dev, struct spdk_scsi_task *task,
+				   enum spdk_scsi_task_func func);
 void spdk_scsi_dev_queue_task(struct spdk_scsi_dev *dev, struct spdk_scsi_task *task);
 int spdk_scsi_dev_add_port(struct spdk_scsi_dev *dev, uint64_t id, const char *name);
+int spdk_scsi_dev_delete_port(struct spdk_scsi_dev *dev, uint64_t id);
 struct spdk_scsi_port *spdk_scsi_dev_find_port_by_id(struct spdk_scsi_dev *dev, uint64_t id);
-void spdk_scsi_dev_print(struct spdk_scsi_dev *dev);
 int spdk_scsi_dev_allocate_io_channels(struct spdk_scsi_dev *dev);
 void spdk_scsi_dev_free_io_channels(struct spdk_scsi_dev *dev);
 
 /**
-
-\brief Constructs a SCSI device object using the given parameters.
-
-\param name Name for the SCSI device.
-\param queue_depth Queue depth for the SCSI device.  This queue depth is
-		   a combined queue depth for all LUNs in the device.
-\param lun_list List of LUN objects for the SCSI device.  Caller is
-		responsible for managing the memory containing this list.
-\param lun_id_list List of LUN IDs for the LUN in this SCSI device.  Caller is
-		   responsible for managing the memory containing this list.
-		   lun_id_list[x] is the LUN ID for lun_list[x].
-\param num_luns Number of entries in lun_list and lun_id_list.
-\return The constructed spdk_scsi_dev object.
-
-*/
+ * \brief Constructs a SCSI device object using the given parameters.
+ *
+ * \param name Name for the SCSI device.
+ * \param bdev_name_list List of bdev names to attach to the LUNs for this SCSI
+ *                       device.
+ * \param lun_id_list List of LUN IDs for the LUN in this SCSI device.  Caller is
+ *		      responsible for managing the memory containing this list.
+ *		      lun_id_list[x] is the LUN ID for lun_list[x].
+ * \param num_luns Number of entries in lun_list and lun_id_list.
+ * \param hotremove_cb Callback to lun hotremoval. Will be called
+ *		       once hotremove is first triggered.
+ * \param hotremove_ctx Additional argument to hotremove_cb
+ * \return The constructed spdk_scsi_dev object.
+ */
 struct spdk_scsi_dev *spdk_scsi_dev_construct(const char *name,
-		char *lun_name_list[],
+		const char *bdev_name_list[],
 		int *lun_id_list,
-		int num_luns);
+		int num_luns,
+		uint8_t protocol_id,
+		void (*hotremove_cb)(const struct spdk_scsi_lun *, void *),
+		void *hotremove_ctx);
 
 void spdk_scsi_dev_delete_lun(struct spdk_scsi_dev *dev, struct spdk_scsi_lun *lun);
+int spdk_scsi_dev_add_lun(struct spdk_scsi_dev *dev, const char *bdev_name, int lun_id,
+			  void (*hotremove_cb)(const struct spdk_scsi_lun *, void *),
+			  void *hotremove_ctx);
+
+struct spdk_scsi_port *spdk_scsi_port_create(uint64_t id, uint16_t index, const char *name);
+void spdk_scsi_port_free(struct spdk_scsi_port **pport);
+const char *spdk_scsi_port_get_name(const struct spdk_scsi_port *port);
 
 
-int spdk_scsi_port_construct(struct spdk_scsi_port *port, uint64_t id,
-			     uint16_t index, const char *name);
-
-
-void spdk_scsi_task_construct(struct spdk_scsi_task *task, uint32_t *owner_task_ctr,
-			      struct spdk_scsi_task *parent);
+void spdk_scsi_task_construct(struct spdk_scsi_task *task,
+			      spdk_scsi_task_cpl cpl_fn,
+			      spdk_scsi_task_free free_fn);
 void spdk_scsi_task_put(struct spdk_scsi_task *task);
 
 void spdk_scsi_task_free_data(struct spdk_scsi_task *task);
@@ -290,15 +236,10 @@ void spdk_scsi_task_build_sense_data(struct spdk_scsi_task *task, int sk, int as
 				     int ascq);
 void spdk_scsi_task_set_status(struct spdk_scsi_task *task, int sc, int sk, int asc,
 			       int ascq);
+void spdk_scsi_task_process_null_lun(struct spdk_scsi_task *task);
 
-static inline struct spdk_scsi_task *
-spdk_scsi_task_get_primary(struct spdk_scsi_task *task)
-{
-	if (task->parent) {
-		return task->parent;
-	} else {
-		return task;
-	}
+#ifdef __cplusplus
 }
+#endif
 
 #endif /* SPDK_SCSI_H */

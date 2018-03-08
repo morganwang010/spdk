@@ -31,16 +31,7 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <errno.h>
-#include <inttypes.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-
-#include <rte_config.h>
-#include <rte_lcore.h>
+#include "spdk/stdinc.h"
 
 #include "spdk/barrier.h"
 #include "spdk/fd.h"
@@ -48,11 +39,10 @@
 #include "spdk/env.h"
 #include "spdk/string.h"
 #include "spdk/nvme_intel.h"
+#include "spdk/histogram_data.h"
 
 #if HAVE_LIBAIO
 #include <libaio.h>
-#include <sys/stat.h>
-#include <fcntl.h>
 #endif
 
 struct ctrlr_entry {
@@ -89,6 +79,9 @@ struct ns_entry {
 	bool			is_draining;
 	uint32_t		current_queue_depth;
 	char			name[1024];
+
+	struct spdk_histogram_data	*submit_histogram;
+	struct spdk_histogram_data	*complete_histogram;
 };
 
 struct perf_task {
@@ -98,6 +91,8 @@ struct perf_task {
 	struct iocb		iocb;
 #endif
 };
+
+static bool g_enable_histogram = false;
 
 static struct ctrlr_entry *g_ctrlr = NULL;
 static struct ns_entry *g_ns = NULL;
@@ -155,6 +150,8 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 	entry->size_in_ios = spdk_nvme_ns_get_size(ns) /
 			     g_io_size_bytes;
 	entry->io_size_blocks = g_io_size_bytes / spdk_nvme_ns_get_sector_size(ns);
+	entry->submit_histogram = spdk_histogram_data_alloc();
+	entry->complete_histogram = spdk_histogram_data_alloc();
 
 	snprintf(entry->name, 44, "%-20.20s (%-20.20s)", cdata->mn, cdata->sn);
 
@@ -316,6 +313,9 @@ submit_single_io(void)
 	if (tsc_submit > g_tsc_submit_max) {
 		g_tsc_submit_max = tsc_submit;
 	}
+	if (g_enable_histogram) {
+		spdk_histogram_data_tally(entry->submit_histogram, tsc_submit);
+	}
 
 	if (rc != 0) {
 		fprintf(stderr, "starting I/O failed\n");
@@ -368,6 +368,9 @@ check_io(void)
 		if (tsc_complete > g_tsc_complete_max) {
 			g_tsc_complete_max = tsc_complete;
 		}
+		if (g_enable_histogram) {
+			spdk_histogram_data_tally(g_ns->complete_histogram, tsc_complete);
+		}
 		g_io_completed++;
 		if (!g_ns->is_draining) {
 			submit_single_io();
@@ -406,7 +409,7 @@ init_ns_worker_ctx(void)
 		 * TODO: If a controller has multiple namespaces, they could all use the same queue.
 		 *  For now, give each namespace/thread combination its own queue.
 		 */
-		g_ns->u.nvme.qpair = spdk_nvme_ctrlr_alloc_io_qpair(g_ns->u.nvme.ctrlr, 0);
+		g_ns->u.nvme.qpair = spdk_nvme_ctrlr_alloc_io_qpair(g_ns->u.nvme.ctrlr, NULL, 0);
 		if (!g_ns->u.nvme.qpair) {
 			printf("ERROR: spdk_nvme_ctrlr_alloc_io_qpair failed\n");
 			return -1;
@@ -433,8 +436,6 @@ static int
 work_fn(void)
 {
 	uint64_t tsc_end;
-
-	printf("Starting work_fn on core %u\n", rte_lcore_id());
 
 	/* Allocate a queue pair for each namespace. */
 	if (init_ns_worker_ctx() != 0) {
@@ -477,19 +478,58 @@ static void usage(char *program_name)
 	printf("\t[-s io size in bytes]\n");
 	printf("\t[-t time in seconds]\n");
 	printf("\t\t(default: 1)]\n");
+	printf("\t[-H enable histograms]\n");
+}
+
+static void
+print_bucket(void *ctx, uint64_t start, uint64_t end, uint64_t count,
+	     uint64_t total, uint64_t so_far)
+{
+	double so_far_pct;
+
+	if (count == 0) {
+		return;
+	}
+
+	so_far_pct = (double)so_far * 100 / total;
+
+	printf("%9.3f - %9.3f: %9.4f%%  (%9ju)\n",
+	       (double)start * 1000 * 1000 / g_tsc_rate,
+	       (double)end * 1000 * 1000 / g_tsc_rate,
+	       so_far_pct, count);
 }
 
 static void
 print_stats(void)
 {
-	printf("g_tsc_submit = %ju\n", g_tsc_submit);
-	printf("g_tsc_complete = %ju\n", g_tsc_complete);
-	printf("g_io_completed = %ju\n", g_io_completed);
+	double divisor = (double)g_tsc_rate / (1000 * 1000 * 1000);
 
-	printf("submit   avg, min, max = %8.1f, %ju, %ju\n",
-	       (float)g_tsc_submit / g_io_completed, g_tsc_submit_min, g_tsc_submit_max);
-	printf("complete avg, min, max = %8.1f, %ju, %ju\n",
-	       (float)g_tsc_complete / g_io_completed, g_tsc_complete_min, g_tsc_complete_max);
+	printf("submit (in ns)   avg, min, max = %8.1f, %8.1f, %8.1f\n",
+	       (double)g_tsc_submit / g_io_completed / divisor,
+	       (double)g_tsc_submit_min / divisor,
+	       (double)g_tsc_submit_max / divisor);
+	printf("complete (in ns) avg, min, max = %8.1f, %8.1f, %8.1f\n",
+	       (double)g_tsc_complete / g_io_completed / divisor,
+	       (double)g_tsc_complete_min / divisor,
+	       (double)g_tsc_complete_max / divisor);
+
+	if (!g_enable_histogram) {
+		return;
+	}
+
+	printf("\n");
+	printf("Submit histogram\n");
+	printf("================\n");
+	printf("       Range in us     Cumulative     Count\n");
+	spdk_histogram_data_iterate(g_ns->submit_histogram, print_bucket, NULL);
+	printf("\n");
+
+	printf("Complete histogram\n");
+	printf("==================\n");
+	printf("       Range in us     Cumulative     Count\n");
+	spdk_histogram_data_iterate(g_ns->complete_histogram, print_bucket, NULL);
+	printf("\n");
+
 }
 
 static int
@@ -497,17 +537,24 @@ parse_args(int argc, char **argv)
 {
 	int op;
 
-	/* default value*/
+	/* default value */
 	g_io_size_bytes = 0;
 	g_time_in_sec = 0;
 
-	while ((op = getopt(argc, argv, "s:t:")) != -1) {
+	while ((op = getopt(argc, argv, "hs:t:H")) != -1) {
 		switch (op) {
+		case 'h':
+			usage(argv[0]);
+			exit(0);
+			break;
 		case 's':
 			g_io_size_bytes = atoi(optarg);
 			break;
 		case 't':
 			g_time_in_sec = atoi(optarg);
+			break;
+		case 'H':
+			g_enable_histogram = true;
 			break;
 		default:
 			usage(argv[0]);
@@ -525,7 +572,7 @@ parse_args(int argc, char **argv)
 	}
 
 	g_aio_optind = optind;
-	optind = 1;
+
 	return 0;
 }
 
@@ -562,45 +609,47 @@ register_controllers(void)
 {
 	printf("Initializing NVMe Controllers\n");
 
-	if (spdk_nvme_probe(NULL, probe_cb, attach_cb, NULL) != 0) {
+	if (spdk_nvme_probe(NULL, NULL, probe_cb, attach_cb, NULL) != 0) {
 		fprintf(stderr, "spdk_nvme_probe() failed\n");
+		return 1;
+	}
+
+	if (g_ns == NULL) {
+		fprintf(stderr, "no NVMe controller found - check that device is bound to uio/vfio\n");
 		return 1;
 	}
 
 	return 0;
 }
 
-static char *ealargs[] = {
-	"perf",
-	"-c 0x1",
-	"-n 4",
-};
-
 int main(int argc, char **argv)
 {
-	int rc;
+	int			rc;
+	struct spdk_env_opts	opts;
 
 	rc = parse_args(argc, argv);
 	if (rc != 0) {
 		return rc;
 	}
 
-	rc = rte_eal_init(sizeof(ealargs) / sizeof(ealargs[0]), ealargs);
-
-	if (rc < 0) {
-		fprintf(stderr, "could not initialize dpdk\n");
+	spdk_env_opts_init(&opts);
+	opts.name = "overhead";
+	opts.core_mask = "0x1";
+	opts.shm_id = 0;
+	if (spdk_env_init(&opts) < 0) {
+		fprintf(stderr, "Unable to initialize SPDK env\n");
 		return 1;
 	}
 
-	g_task = spdk_zmalloc(sizeof(struct perf_task), 0, NULL);
+	g_task = spdk_dma_zmalloc(sizeof(struct perf_task), 0, NULL);
 	if (g_task == NULL) {
 		fprintf(stderr, "g_task alloc failed\n");
 		exit(1);
 	}
 
-	g_task->buf = spdk_zmalloc(g_io_size_bytes, 0x1000, NULL);
+	g_task->buf = spdk_dma_zmalloc(g_io_size_bytes, 0x1000, NULL);
 	if (g_task->buf == NULL) {
-		fprintf(stderr, "g_task->buf spdk_zmalloc failed\n");
+		fprintf(stderr, "g_task->buf spdk_dma_zmalloc failed\n");
 		exit(1);
 	}
 
@@ -629,6 +678,8 @@ int main(int argc, char **argv)
 	print_stats();
 
 cleanup:
+	spdk_histogram_data_free(g_ns->submit_histogram);
+	spdk_histogram_data_free(g_ns->complete_histogram);
 	free(g_ns);
 	if (g_ctrlr) {
 		spdk_nvme_detach(g_ctrlr->ctrlr);

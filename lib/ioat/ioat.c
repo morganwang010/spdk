@@ -31,13 +31,14 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "spdk/stdinc.h"
+
 #include "ioat_internal.h"
 
 #include "spdk/env.h"
+#include "spdk/util.h"
 
 #include "spdk_internal/log.h"
-
-#include <pthread.h>
 
 struct ioat_driver {
 	pthread_mutex_t			lock;
@@ -353,11 +354,11 @@ ioat_channel_destruct(struct spdk_ioat_chan *ioat)
 	}
 
 	if (ioat->hw_ring) {
-		spdk_free(ioat->hw_ring);
+		spdk_dma_free(ioat->hw_ring);
 	}
 
 	if (ioat->comp_update) {
-		spdk_free((void *)ioat->comp_update);
+		spdk_dma_free((void *)ioat->comp_update);
 		ioat->comp_update = NULL;
 	}
 
@@ -386,8 +387,9 @@ ioat_channel_start(struct spdk_ioat_chan *ioat)
 
 	/* Always support DMA copy */
 	ioat->dma_capabilities = SPDK_IOAT_ENGINE_COPY_SUPPORTED;
-	if (ioat->regs->dmacapability & SPDK_IOAT_DMACAP_BFILL)
+	if (ioat->regs->dmacapability & SPDK_IOAT_DMACAP_BFILL) {
 		ioat->dma_capabilities |= SPDK_IOAT_ENGINE_FILL_SUPPORTED;
+	}
 	xfercap = ioat->regs->xfercap;
 
 	/* Only bits [4:0] are valid. */
@@ -403,8 +405,8 @@ ioat_channel_start(struct spdk_ioat_chan *ioat)
 		ioat->max_xfer_size = 1U << xfercap;
 	}
 
-	ioat->comp_update = spdk_zmalloc(sizeof(*ioat->comp_update), SPDK_IOAT_CHANCMP_ALIGN,
-					 &comp_update_bus_addr);
+	ioat->comp_update = spdk_dma_zmalloc(sizeof(*ioat->comp_update), SPDK_IOAT_CHANCMP_ALIGN,
+					     &comp_update_bus_addr);
 	if (ioat->comp_update == NULL) {
 		return -1;
 	}
@@ -418,8 +420,8 @@ ioat_channel_start(struct spdk_ioat_chan *ioat)
 		return -1;
 	}
 
-	ioat->hw_ring = spdk_zmalloc(num_descriptors * sizeof(union spdk_ioat_hw_desc), 64,
-				     &ioat->hw_ring_phys_addr);
+	ioat->hw_ring = spdk_dma_zmalloc(num_descriptors * sizeof(union spdk_ioat_hw_desc), 64,
+					 &ioat->hw_ring_phys_addr);
 	if (!ioat->hw_ring) {
 		return -1;
 	}
@@ -445,8 +447,9 @@ ioat_channel_start(struct spdk_ioat_chan *ioat)
 	while (i-- > 0) {
 		spdk_delay_us(100);
 		status = ioat_get_chansts(ioat);
-		if (is_ioat_idle(status))
+		if (is_ioat_idle(status)) {
 			break;
+		}
 	}
 
 	if (is_ioat_idle(status)) {
@@ -464,7 +467,7 @@ ioat_channel_start(struct spdk_ioat_chan *ioat)
 static struct spdk_ioat_chan *
 ioat_attach(void *device)
 {
-	struct spdk_ioat_chan 	*ioat;
+	struct spdk_ioat_chan *ioat;
 	uint32_t cmd_reg;
 
 	ioat = calloc(1, sizeof(struct spdk_ioat_chan));
@@ -569,12 +572,10 @@ spdk_ioat_detach(struct spdk_ioat_chan *ioat)
 	return 0;
 }
 
-#define min(a, b) (((a)<(b))?(a):(b))
-
 #define _2MB_PAGE(ptr)		((ptr) & ~(0x200000 - 1))
 #define _2MB_OFFSET(ptr)	((ptr) &  (0x200000 - 1))
 
-int64_t
+int
 spdk_ioat_submit_copy(struct spdk_ioat_chan *ioat, void *cb_arg, spdk_ioat_req_cb cb_fn,
 		      void *dst, const void *src, uint64_t nbytes)
 {
@@ -586,25 +587,31 @@ spdk_ioat_submit_copy(struct spdk_ioat_chan *ioat, void *cb_arg, spdk_ioat_req_c
 	uint32_t	orig_head;
 
 	if (!ioat) {
-		return -1;
+		return -EINVAL;
 	}
 
 	orig_head = ioat->head;
 
 	vdst = (uint64_t)dst;
 	vsrc = (uint64_t)src;
-	vsrc_page = _2MB_PAGE(vsrc);
-	vdst_page = _2MB_PAGE(vdst);
-	psrc_page = spdk_vtophys((void *)vsrc_page);
-	pdst_page = spdk_vtophys((void *)vdst_page);
+	vdst_page = vsrc_page = 0;
+	pdst_page = psrc_page = SPDK_VTOPHYS_ERROR;
 
 	remaining = nbytes;
-
 	while (remaining) {
+		if (_2MB_PAGE(vsrc) != vsrc_page) {
+			vsrc_page = _2MB_PAGE(vsrc);
+			psrc_page = spdk_vtophys((void *)vsrc_page);
+		}
+
+		if (_2MB_PAGE(vdst) != vdst_page) {
+			vdst_page = _2MB_PAGE(vdst);
+			pdst_page = spdk_vtophys((void *)vdst_page);
+		}
 		op_size = remaining;
-		op_size = min(op_size, (0x200000 - _2MB_OFFSET(vsrc)));
-		op_size = min(op_size, (0x200000 - _2MB_OFFSET(vdst)));
-		op_size = min(op_size, ioat->max_xfer_size);
+		op_size = spdk_min(op_size, (0x200000 - _2MB_OFFSET(vsrc)));
+		op_size = spdk_min(op_size, (0x200000 - _2MB_OFFSET(vdst)));
+		op_size = spdk_min(op_size, ioat->max_xfer_size);
 		remaining -= op_size;
 
 		last_desc = ioat_prep_copy(ioat,
@@ -619,15 +626,6 @@ spdk_ioat_submit_copy(struct spdk_ioat_chan *ioat, void *cb_arg, spdk_ioat_req_c
 		vsrc += op_size;
 		vdst += op_size;
 
-		if (_2MB_PAGE(vsrc) != vsrc_page) {
-			vsrc_page = _2MB_PAGE(vsrc);
-			psrc_page = spdk_vtophys((void *)vsrc_page);
-		}
-
-		if (_2MB_PAGE(vdst) != vdst_page) {
-			vdst_page = _2MB_PAGE(vdst);
-			pdst_page = spdk_vtophys((void *)vdst_page);
-		}
 	}
 	/* Issue null descriptor for null transfer */
 	if (nbytes == 0) {
@@ -643,14 +641,14 @@ spdk_ioat_submit_copy(struct spdk_ioat_chan *ioat, void *cb_arg, spdk_ioat_req_c
 		 * in case we managed to fill out any descriptors.
 		 */
 		ioat->head = orig_head;
-		return -1;
+		return -ENOMEM;
 	}
 
 	ioat_flush(ioat);
-	return nbytes;
+	return 0;
 }
 
-int64_t
+int
 spdk_ioat_submit_fill(struct spdk_ioat_chan *ioat, void *cb_arg, spdk_ioat_req_cb cb_fn,
 		      void *dst, uint64_t fill_pattern, uint64_t nbytes)
 {
@@ -660,7 +658,7 @@ spdk_ioat_submit_fill(struct spdk_ioat_chan *ioat, void *cb_arg, spdk_ioat_req_c
 	uint32_t	orig_head;
 
 	if (!ioat) {
-		return -1;
+		return -EINVAL;
 	}
 
 	if (!(ioat->dma_capabilities & SPDK_IOAT_ENGINE_FILL_SUPPORTED)) {
@@ -675,7 +673,7 @@ spdk_ioat_submit_fill(struct spdk_ioat_chan *ioat, void *cb_arg, spdk_ioat_req_c
 
 	while (remaining) {
 		op_size = remaining;
-		op_size = min(op_size, ioat->max_xfer_size);
+		op_size = spdk_min(op_size, ioat->max_xfer_size);
 		remaining -= op_size;
 
 		last_desc = ioat_prep_fill(ioat,
@@ -699,11 +697,11 @@ spdk_ioat_submit_fill(struct spdk_ioat_chan *ioat, void *cb_arg, spdk_ioat_req_c
 		 * in case we managed to fill out any descriptors.
 		 */
 		ioat->head = orig_head;
-		return -1;
+		return -ENOMEM;
 	}
 
 	ioat_flush(ioat);
-	return nbytes;
+	return 0;
 }
 
 uint32_t
@@ -721,4 +719,4 @@ spdk_ioat_process_events(struct spdk_ioat_chan *ioat)
 	return ioat_process_channel_events(ioat);
 }
 
-SPDK_LOG_REGISTER_TRACE_FLAG("ioat", SPDK_TRACE_IOAT)
+SPDK_LOG_REGISTER_COMPONENT("ioat", SPDK_LOG_IOAT)

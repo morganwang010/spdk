@@ -33,9 +33,11 @@
 
 #include "nvme_internal.h"
 
+static void nvme_qpair_fail(struct spdk_nvme_qpair *qpair);
+
 struct nvme_string {
 	uint16_t	value;
-	const char 	*str;
+	const char	*str;
 };
 
 static const struct nvme_string admin_opcode[] = {
@@ -52,11 +54,19 @@ static const struct nvme_string admin_opcode[] = {
 	{ SPDK_NVME_OPC_NS_MANAGEMENT, "NAMESPACE MANAGEMENT" },
 	{ SPDK_NVME_OPC_FIRMWARE_COMMIT, "FIRMWARE COMMIT" },
 	{ SPDK_NVME_OPC_FIRMWARE_IMAGE_DOWNLOAD, "FIRMWARE IMAGE DOWNLOAD" },
+	{ SPDK_NVME_OPC_DEVICE_SELF_TEST, "DEVICE SELF-TEST" },
 	{ SPDK_NVME_OPC_NS_ATTACHMENT, "NAMESPACE ATTACHMENT" },
 	{ SPDK_NVME_OPC_KEEP_ALIVE, "KEEP ALIVE" },
+	{ SPDK_NVME_OPC_DIRECTIVE_SEND, "DIRECTIVE SEND" },
+	{ SPDK_NVME_OPC_DIRECTIVE_RECEIVE, "DIRECTIVE RECEIVE" },
+	{ SPDK_NVME_OPC_VIRTUALIZATION_MANAGEMENT, "VIRTUALIZATION MANAGEMENT" },
+	{ SPDK_NVME_OPC_NVME_MI_SEND, "NVME-MI SEND" },
+	{ SPDK_NVME_OPC_NVME_MI_RECEIVE, "NVME-MI RECEIVE" },
+	{ SPDK_NVME_OPC_DOORBELL_BUFFER_CONFIG, "DOORBELL BUFFER CONFIG" },
 	{ SPDK_NVME_OPC_FORMAT_NVM, "FORMAT NVM" },
 	{ SPDK_NVME_OPC_SECURITY_SEND, "SECURITY SEND" },
 	{ SPDK_NVME_OPC_SECURITY_RECEIVE, "SECURITY RECEIVE" },
+	{ SPDK_NVME_OPC_SANITIZE, "SANITIZE" },
 	{ 0xFFFF, "ADMIN COMMAND" }
 };
 
@@ -169,11 +179,16 @@ static const struct nvme_string generic_status[] = {
 	{ SPDK_NVME_SC_INVALID_CONTROLLER_MEM_BUF, "INVALID CONTROLLER MEMORY BUFFER" },
 	{ SPDK_NVME_SC_INVALID_PRP_OFFSET, "INVALID PRP OFFSET" },
 	{ SPDK_NVME_SC_ATOMIC_WRITE_UNIT_EXCEEDED, "ATOMIC WRITE UNIT EXCEEDED" },
+	{ SPDK_NVME_SC_OPERATION_DENIED, "OPERATION DENIED" },
 	{ SPDK_NVME_SC_INVALID_SGL_OFFSET, "INVALID SGL OFFSET" },
-	{ SPDK_NVME_SC_INVALID_SGL_SUBTYPE, "INVALID SGL SUBTYPE" },
 	{ SPDK_NVME_SC_HOSTID_INCONSISTENT_FORMAT, "HOSTID INCONSISTENT FORMAT" },
 	{ SPDK_NVME_SC_KEEP_ALIVE_EXPIRED, "KEEP ALIVE EXPIRED" },
 	{ SPDK_NVME_SC_KEEP_ALIVE_INVALID, "KEEP ALIVE INVALID" },
+	{ SPDK_NVME_SC_ABORTED_PREEMPT, "ABORTED - PREEMPT AND ABORT" },
+	{ SPDK_NVME_SC_SANITIZE_FAILED, "SANITIZE FAILED" },
+	{ SPDK_NVME_SC_SANITIZE_IN_PROGRESS, "SANITIZE IN PROGRESS" },
+	{ SPDK_NVME_SC_SGL_DATA_BLOCK_GRANULARITY_INVALID, "DATA BLOCK GRANULARITY INVALID" },
+	{ SPDK_NVME_SC_COMMAND_INVALID_IN_CMB, "COMMAND NOT SUPPORTED FOR QUEUE IN CMB" },
 	{ SPDK_NVME_SC_LBA_OUT_OF_RANGE, "LBA OUT OF RANGE" },
 	{ SPDK_NVME_SC_CAPACITY_EXCEEDED, "CAPACITY EXCEEDED" },
 	{ SPDK_NVME_SC_NAMESPACE_NOT_READY, "NAMESPACE NOT READY" },
@@ -210,6 +225,12 @@ static const struct nvme_string command_specific_status[] = {
 	{ SPDK_NVME_SC_NAMESPACE_NOT_ATTACHED, "NAMESPACE NOT ATTACHED" },
 	{ SPDK_NVME_SC_THINPROVISIONING_NOT_SUPPORTED, "THINPROVISIONING NOT SUPPORTED" },
 	{ SPDK_NVME_SC_CONTROLLER_LIST_INVALID, "CONTROLLER LIST INVALID" },
+	{ SPDK_NVME_SC_DEVICE_SELF_TEST_IN_PROGRESS, "DEVICE SELF-TEST IN PROGRESS" },
+	{ SPDK_NVME_SC_BOOT_PARTITION_WRITE_PROHIBITED, "BOOT PARTITION WRITE PROHIBITED" },
+	{ SPDK_NVME_SC_INVALID_CTRLR_ID, "INVALID CONTROLLER ID" },
+	{ SPDK_NVME_SC_INVALID_SECONDARY_CTRLR_STATE, "INVALID SECONDARY CONTROLLER STATE" },
+	{ SPDK_NVME_SC_INVALID_NUM_CTRLR_RESOURCES, "INVALID NUMBER OF CONTROLLER RESOURCES" },
+	{ SPDK_NVME_SC_INVALID_RESOURCE_ID, "INVALID RESOURCE IDENTIFIER" },
 	{ SPDK_NVME_SC_CONFLICTING_ATTRIBUTES, "CONFLICTING ATTRIBUTES" },
 	{ SPDK_NVME_SC_INVALID_PROTECTION_INFO, "INVALID PROTECTION INFO" },
 	{ SPDK_NVME_SC_ATTEMPTED_WRITE_TO_RO_PAGE, "WRITE TO RO PAGE" },
@@ -336,25 +357,60 @@ nvme_qpair_manual_complete_request(struct spdk_nvme_qpair *qpair,
 int32_t
 spdk_nvme_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_completions)
 {
-	return nvme_transport_qpair_process_completions(qpair, max_completions);
+	int32_t ret;
+
+	if (qpair->ctrlr->is_failed) {
+		nvme_qpair_fail(qpair);
+		return 0;
+	}
+
+	qpair->in_completion_context = 1;
+	ret = nvme_transport_qpair_process_completions(qpair, max_completions);
+	qpair->in_completion_context = 0;
+	if (qpair->delete_after_completion_context) {
+		/*
+		 * A request to delete this qpair was made in the context of this completion
+		 *  routine - so it is safe to delete it now.
+		 */
+		spdk_nvme_ctrlr_free_io_qpair(qpair);
+	}
+	return ret;
 }
 
 int
-nvme_qpair_construct(struct spdk_nvme_qpair *qpair, uint16_t id,
-		     uint16_t num_entries,
-		     struct spdk_nvme_ctrlr *ctrlr,
-		     enum spdk_nvme_qprio qprio)
+nvme_qpair_init(struct spdk_nvme_qpair *qpair, uint16_t id,
+		struct spdk_nvme_ctrlr *ctrlr,
+		enum spdk_nvme_qprio qprio,
+		uint32_t num_requests)
 {
-	assert(num_entries != 0);
+	size_t req_size_padded;
+	uint32_t i;
 
 	qpair->id = id;
-	qpair->num_entries = num_entries;
 	qpair->qprio = qprio;
+
+	qpair->in_completion_context = 0;
+	qpair->delete_after_completion_context = 0;
+	qpair->no_deletion_notification_needed = 0;
 
 	qpair->ctrlr = ctrlr;
 	qpair->trtype = ctrlr->trid.trtype;
 
+	STAILQ_INIT(&qpair->free_req);
 	STAILQ_INIT(&qpair->queued_req);
+
+	req_size_padded = (sizeof(struct nvme_request) + 63) & ~(size_t)63;
+
+	qpair->req_buf = spdk_dma_zmalloc(req_size_padded * num_requests, 64, NULL);
+	if (qpair->req_buf == NULL) {
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < num_requests; i++) {
+		struct nvme_request *req = qpair->req_buf + i * req_size_padded;
+
+		STAILQ_INSERT_HEAD(&qpair->free_req, req, stailq);
+	}
 
 	return 0;
 }
@@ -380,8 +436,9 @@ nvme_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request *re
 		TAILQ_FOREACH_SAFE(child_req, &req->children, child_tailq, tmp) {
 			if (!child_req_failed) {
 				rc = nvme_qpair_submit_request(qpair, child_req);
-				if (rc != 0)
+				if (rc != 0) {
 					child_req_failed = true;
+				}
 			} else { /* free remaining child_reqs since one child_req fails */
 				nvme_request_remove_child(req, child_req);
 				nvme_free_request(child_req);
@@ -425,7 +482,7 @@ nvme_qpair_disable(struct spdk_nvme_qpair *qpair)
 	nvme_transport_qpair_disable(qpair);
 }
 
-void
+static void
 nvme_qpair_fail(struct spdk_nvme_qpair *qpair)
 {
 	struct nvme_request		*req;

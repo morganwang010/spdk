@@ -35,55 +35,12 @@
  * NVMe end-to-end data protection test
  */
 
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <inttypes.h>
-#include <string.h>
-
-#include <rte_config.h>
-#include <rte_lcore.h>
+#include "spdk/stdinc.h"
 
 #include "spdk/nvme.h"
 #include "spdk/env.h"
-
-static uint32_t swap32(uint32_t value)
-{
-	uint32_t result = 0;
-	result |= (value & 0x000000FF) << 24;
-	result |= (value & 0x0000FF00) << 8;
-	result |= (value & 0x00FF0000) >> 8;
-	result |= (value & 0xFF000000) >> 24;
-	return result;
-}
-
-
-static uint16_t swap16(uint16_t value)
-{
-	uint16_t result = 0;
-
-	result |= (value & 0x00FF) << 8;
-	result |= (value & 0xFF00) >> 8;
-
-	return result;
-}
-
-static uint16_t crc16_t10dif(uint8_t *buf, size_t len)
-{
-	uint32_t rem = 0;
-	unsigned int i, j;
-
-	uint16_t poly = 0x8bb7;
-
-	for (i = 0; i < len; i++) {
-		rem = rem ^ (buf[i] << 8);
-		for (j = 0; j < 8; j++) {
-			rem = rem << 1;
-			rem = (rem & 0x10000) ? rem ^ poly : rem;
-		}
-	}
-	return (uint16_t)rem;
-}
+#include "spdk/crc16.h"
+#include "spdk/endian.h"
 
 #define MAX_DEVS 64
 
@@ -91,7 +48,7 @@ static uint16_t crc16_t10dif(uint8_t *buf, size_t len)
 
 struct dev {
 	struct spdk_nvme_ctrlr			*ctrlr;
-	char 					name[100];
+	char					name[SPDK_NVMF_TRADDR_MAX_LEN + 1];
 };
 
 static struct dev devs[MAX_DEVS];
@@ -118,10 +75,11 @@ struct io_request {
 static void
 io_complete(void *ctx, const struct spdk_nvme_cpl *cpl)
 {
-	if (spdk_nvme_cpl_is_error(cpl))
+	if (spdk_nvme_cpl_is_error(cpl)) {
 		io_complete_flag = 2;
-	else
+	} else {
 		io_complete_flag = 1;
+	}
 }
 
 static void
@@ -135,10 +93,11 @@ ns_data_buffer_reset(struct spdk_nvme_ns *ns, struct io_request *req, uint8_t da
 	md_size = spdk_nvme_ns_get_md_size(ns);
 
 	for (i = 0; i < req->lba_count; i++) {
-		if (req->use_extended_lba)
+		if (req->use_extended_lba) {
 			offset = (sector_size + md_size) * i;
-		else
+		} else {
 			offset = sector_size * i;
+		}
 
 		buf = (uint8_t *)req->contig + offset;
 		memset(buf, data_pattern, sector_size);
@@ -176,14 +135,16 @@ static uint32_t dp_guard_check_extended_lba_test(struct spdk_nvme_ns *ns, struct
 	req->lba_count = 2;
 
 	/* extended LBA only for the test case */
-	if (!(spdk_nvme_ns_supports_extended_lba(ns)))
+	if (!(spdk_nvme_ns_supports_extended_lba(ns))) {
 		return 0;
+	}
 
 	sector_size = spdk_nvme_ns_get_sector_size(ns);
 	md_size = spdk_nvme_ns_get_md_size(ns);
-	req->contig = spdk_zmalloc((sector_size + md_size) * req->lba_count, 0x1000, NULL);
-	if (!req->contig)
+	req->contig = spdk_dma_zmalloc((sector_size + md_size) * req->lba_count, 0x1000, NULL);
+	if (!req->contig) {
 		return 0;
+	}
 
 	req->lba = 0x200000;
 	req->use_extended_lba = true;
@@ -193,10 +154,10 @@ static uint32_t dp_guard_check_extended_lba_test(struct spdk_nvme_ns *ns, struct
 	ns_data_buffer_reset(ns, req, DATA_PATTERN);
 	pi = (struct spdk_nvme_protection_info *)(req->contig + sector_size + md_size - 8);
 	/* big-endian for guard */
-	pi->guard = swap16(crc16_t10dif(req->contig, sector_size));
+	to_be16(&pi->guard, spdk_crc16_t10dif(req->contig, sector_size));
 
 	pi = (struct spdk_nvme_protection_info *)(req->contig + (sector_size + md_size) * 2 - 8);
-	pi->guard = swap16(crc16_t10dif(req->contig + sector_size + md_size, sector_size));
+	to_be16(&pi->guard, spdk_crc16_t10dif(req->contig + sector_size + md_size, sector_size));
 
 	*io_flags = SPDK_NVME_IO_FLAGS_PRCHK_GUARD;
 
@@ -217,9 +178,10 @@ static uint32_t dp_with_pract_test(struct spdk_nvme_ns *ns, struct io_request *r
 
 	sector_size = spdk_nvme_ns_get_sector_size(ns);
 	/* No additional metadata buffer provided */
-	req->contig = spdk_zmalloc(sector_size * req->lba_count, 0x1000, NULL);
-	if (!req->contig)
+	req->contig = spdk_dma_zmalloc(sector_size * req->lba_count, 0x1000, NULL);
+	if (!req->contig) {
 		return 0;
+	}
 
 	switch (spdk_nvme_ns_get_pi_type(ns)) {
 	case SPDK_NVME_FMT_NVM_PROTECTION_TYPE3:
@@ -259,25 +221,27 @@ static uint32_t dp_without_pract_extended_lba_test(struct spdk_nvme_ns *ns, stru
 	}
 
 	/* extended LBA only for the test case */
-	if (!(spdk_nvme_ns_supports_extended_lba(ns)))
+	if (!(spdk_nvme_ns_supports_extended_lba(ns))) {
 		return 0;
+	}
 
 	sector_size = spdk_nvme_ns_get_sector_size(ns);
 	md_size = spdk_nvme_ns_get_md_size(ns);
-	req->contig = spdk_zmalloc((sector_size + md_size) * req->lba_count, 0x1000, NULL);
-	if (!req->contig)
+	req->contig = spdk_dma_zmalloc((sector_size + md_size) * req->lba_count, 0x1000, NULL);
+	if (!req->contig) {
 		return 0;
+	}
 
 	req->lba = 0x200000;
 	req->use_extended_lba = true;
 	req->metadata = NULL;
 	pi = (struct spdk_nvme_protection_info *)(req->contig + sector_size + md_size - 8);
 	/* big-endian for reference tag */
-	pi->ref_tag = swap32((uint32_t)req->lba);
+	to_be32(&pi->ref_tag, (uint32_t)req->lba);
 
 	pi = (struct spdk_nvme_protection_info *)(req->contig + (sector_size + md_size) * 2 - 8);
 	/* is incremented for each subsequent logical block */
-	pi->ref_tag = swap32((uint32_t)req->lba + 1);
+	to_be32(&pi->ref_tag, (uint32_t)(req->lba + 1));
 
 	*io_flags = SPDK_NVME_IO_FLAGS_PRCHK_REFTAG;
 
@@ -293,14 +257,16 @@ static uint32_t dp_without_flags_extended_lba_test(struct spdk_nvme_ns *ns, stru
 	req->lba_count = 16;
 
 	/* extended LBA only for the test case */
-	if (!(spdk_nvme_ns_supports_extended_lba(ns)))
+	if (!(spdk_nvme_ns_supports_extended_lba(ns))) {
 		return 0;
+	}
 
 	sector_size = spdk_nvme_ns_get_sector_size(ns);
 	md_size = spdk_nvme_ns_get_md_size(ns);
-	req->contig = spdk_zmalloc((sector_size + md_size) * req->lba_count, 0x1000, NULL);
-	if (!req->contig)
+	req->contig = spdk_dma_zmalloc((sector_size + md_size) * req->lba_count, 0x1000, NULL);
+	if (!req->contig) {
 		return 0;
+	}
 
 	req->lba = 0x400000;
 	req->use_extended_lba = true;
@@ -327,18 +293,20 @@ static uint32_t dp_without_pract_separate_meta_test(struct spdk_nvme_ns *ns, str
 	}
 
 	/* separate metadata payload for the test case */
-	if (spdk_nvme_ns_supports_extended_lba(ns))
+	if (spdk_nvme_ns_supports_extended_lba(ns)) {
 		return 0;
+	}
 
 	sector_size = spdk_nvme_ns_get_sector_size(ns);
 	md_size = spdk_nvme_ns_get_md_size(ns);
-	req->contig = spdk_zmalloc(sector_size * req->lba_count, 0x1000, NULL);
-	if (!req->contig)
+	req->contig = spdk_dma_zmalloc(sector_size * req->lba_count, 0x1000, NULL);
+	if (!req->contig) {
 		return 0;
+	}
 
-	req->metadata = spdk_zmalloc(md_size * req->lba_count, 0x1000, NULL);
+	req->metadata = spdk_dma_zmalloc(md_size * req->lba_count, 0x1000, NULL);
 	if (!req->metadata) {
-		spdk_free(req->contig);
+		spdk_dma_free(req->contig);
 		return 0;
 	}
 
@@ -348,11 +316,11 @@ static uint32_t dp_without_pract_separate_meta_test(struct spdk_nvme_ns *ns, str
 	/* last 8 bytes if the metadata size bigger than 8 */
 	pi = (struct spdk_nvme_protection_info *)(req->metadata + md_size - 8);
 	/* big-endian for reference tag */
-	pi->ref_tag = swap32((uint32_t)req->lba);
+	to_be32(&pi->ref_tag, (uint32_t)req->lba);
 
 	pi = (struct spdk_nvme_protection_info *)(req->metadata + md_size * 2 - 8);
 	/* is incremented for each subsequent logical block */
-	pi->ref_tag = swap32((uint32_t)req->lba + 1);
+	to_be32(&pi->ref_tag, (uint32_t)(req->lba + 1));
 
 	*io_flags = SPDK_NVME_IO_FLAGS_PRCHK_REFTAG;
 
@@ -370,18 +338,20 @@ static uint32_t dp_without_pract_separate_meta_apptag_test(struct spdk_nvme_ns *
 	req->lba_count = 1;
 
 	/* separate metadata payload for the test case */
-	if (spdk_nvme_ns_supports_extended_lba(ns))
+	if (spdk_nvme_ns_supports_extended_lba(ns)) {
 		return 0;
+	}
 
 	sector_size = spdk_nvme_ns_get_sector_size(ns);
 	md_size = spdk_nvme_ns_get_md_size(ns);
-	req->contig = spdk_zmalloc(sector_size * req->lba_count, 0x1000, NULL);
-	if (!req->contig)
+	req->contig = spdk_dma_zmalloc(sector_size * req->lba_count, 0x1000, NULL);
+	if (!req->contig) {
 		return 0;
+	}
 
-	req->metadata = spdk_zmalloc(md_size * req->lba_count, 0x1000, NULL);
+	req->metadata = spdk_dma_zmalloc(md_size * req->lba_count, 0x1000, NULL);
 	if (!req->metadata) {
-		spdk_free(req->contig);
+		spdk_dma_free(req->contig);
 		return 0;
 	}
 
@@ -392,7 +362,7 @@ static uint32_t dp_without_pract_separate_meta_apptag_test(struct spdk_nvme_ns *
 
 	/* last 8 bytes if the metadata size bigger than 8 */
 	pi = (struct spdk_nvme_protection_info *)(req->metadata + md_size - 8);
-	pi->app_tag = swap16(req->lba_count);
+	to_be16(&pi->app_tag, req->lba_count);
 
 	*io_flags = SPDK_NVME_IO_FLAGS_PRCHK_APPTAG;
 
@@ -411,18 +381,20 @@ static uint32_t dp_without_flags_separate_meta_test(struct spdk_nvme_ns *ns, str
 	req->lba_count = 16;
 
 	/* separate metadata payload for the test case */
-	if (spdk_nvme_ns_supports_extended_lba(ns))
+	if (spdk_nvme_ns_supports_extended_lba(ns)) {
 		return 0;
+	}
 
 	sector_size = spdk_nvme_ns_get_sector_size(ns);
 	md_size = spdk_nvme_ns_get_md_size(ns);
-	req->contig = spdk_zmalloc(sector_size * req->lba_count, 0x1000, NULL);
-	if (!req->contig)
+	req->contig = spdk_dma_zmalloc(sector_size * req->lba_count, 0x1000, NULL);
+	if (!req->contig) {
 		return 0;
+	}
 
-	req->metadata = spdk_zmalloc(md_size * req->lba_count, 0x1000, NULL);
+	req->metadata = spdk_dma_zmalloc(md_size * req->lba_count, 0x1000, NULL);
 	if (!req->metadata) {
-		spdk_free(req->contig);
+		spdk_dma_free(req->contig);
 		return 0;
 	}
 
@@ -443,13 +415,15 @@ free_req(struct io_request *req)
 		return;
 	}
 
-	if (req->contig)
-		spdk_free(req->contig);
+	if (req->contig) {
+		spdk_dma_free(req->contig);
+	}
 
-	if (req->metadata)
-		spdk_free(req->metadata);
+	if (req->metadata) {
+		spdk_dma_free(req->metadata);
+	}
 
-	spdk_free(req);
+	spdk_dma_free(req);
 }
 
 static int
@@ -463,10 +437,11 @@ ns_data_buffer_compare(struct spdk_nvme_ns *ns, struct io_request *req, uint8_t 
 	md_size = spdk_nvme_ns_get_md_size(ns);
 
 	for (i = 0; i < req->lba_count; i++) {
-		if (req->use_extended_lba)
+		if (req->use_extended_lba) {
 			offset = (sector_size + md_size) * i;
-		else
+		} else {
 			offset = sector_size * i;
+		}
 
 		buf = (uint8_t *)req->contig + offset;
 		for (j = 0; j < sector_size; j++) {
@@ -497,8 +472,9 @@ write_read_e2e_dp_tests(struct dev *dev, nvme_build_io_req_fn_t build_io_fn, con
 		return 0;
 	}
 
-	if (!(spdk_nvme_ns_get_flags(ns) & SPDK_NVME_NS_DPS_PI_SUPPORTED))
+	if (!(spdk_nvme_ns_get_flags(ns) & SPDK_NVME_NS_DPS_PI_SUPPORTED)) {
 		return 0;
+	}
 
 	nsdata = spdk_nvme_ns_get_data(ns);
 	if (!nsdata || !spdk_nvme_ns_get_sector_size(ns)) {
@@ -506,7 +482,7 @@ write_read_e2e_dp_tests(struct dev *dev, nvme_build_io_req_fn_t build_io_fn, con
 		return 0;
 	}
 
-	req = spdk_zmalloc(sizeof(*req), 0, NULL);
+	req = spdk_dma_zmalloc(sizeof(*req), 0, NULL);
 	if (!req) {
 		fprintf(stderr, "Allocate request failed\n");
 		return 0;
@@ -521,7 +497,7 @@ write_read_e2e_dp_tests(struct dev *dev, nvme_build_io_req_fn_t build_io_fn, con
 		return 0;
 	}
 
-	qpair = spdk_nvme_ctrlr_alloc_io_qpair(dev->ctrlr, 0);
+	qpair = spdk_nvme_ctrlr_alloc_io_qpair(dev->ctrlr, NULL, 0);
 	if (!qpair) {
 		free_req(req);
 		return -1;
@@ -548,8 +524,9 @@ write_read_e2e_dp_tests(struct dev *dev, nvme_build_io_req_fn_t build_io_fn, con
 
 	io_complete_flag = 0;
 
-	while (!io_complete_flag)
+	while (!io_complete_flag) {
 		spdk_nvme_qpair_process_completions(qpair, 1);
+	}
 
 	if (io_complete_flag != 1) {
 		fprintf(stderr, "%s: %s write exec failed\n", dev->name, test_name);
@@ -581,8 +558,9 @@ write_read_e2e_dp_tests(struct dev *dev, nvme_build_io_req_fn_t build_io_fn, con
 		return -1;
 	}
 
-	while (!io_complete_flag)
+	while (!io_complete_flag) {
 		spdk_nvme_qpair_process_completions(qpair, 1);
+	}
 
 	if (io_complete_flag != 1) {
 		fprintf(stderr, "%s: %s read failed\n", dev->name, test_name);
@@ -631,29 +609,24 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	printf("Attached to %s\n", dev->name);
 }
 
-
-static const char *ealargs[] = {
-	"nvme_dp",
-	"-c 0x1",
-	"-n 4",
-};
-
 int main(int argc, char **argv)
 {
-	struct dev			*iter;
-	int				rc, i;
+	struct dev		*iter;
+	int			rc, i;
+	struct spdk_env_opts	opts;
+
+	spdk_env_opts_init(&opts);
+	opts.name = "nvme_dp";
+	opts.core_mask = "0x1";
+	opts.shm_id = 0;
+	if (spdk_env_init(&opts) < 0) {
+		fprintf(stderr, "Unable to initialize SPDK env\n");
+		return 1;
+	}
 
 	printf("NVMe Write/Read with End-to-End data protection test\n");
 
-	rc = rte_eal_init(sizeof(ealargs) / sizeof(ealargs[0]),
-			  (char **)(void *)(uintptr_t)ealargs);
-
-	if (rc < 0) {
-		fprintf(stderr, "could not initialize dpdk\n");
-		exit(1);
-	}
-
-	if (spdk_nvme_probe(NULL, probe_cb, attach_cb, NULL) != 0) {
+	if (spdk_nvme_probe(NULL, NULL, probe_cb, attach_cb, NULL) != 0) {
 		fprintf(stderr, "nvme_probe() failed\n");
 		exit(1);
 	}

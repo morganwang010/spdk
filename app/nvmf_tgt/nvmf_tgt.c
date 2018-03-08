@@ -31,440 +31,310 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <inttypes.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <signal.h>
-
-#include <rte_config.h>
-#include <rte_lcore.h>
+#include "spdk/stdinc.h"
 
 #include "nvmf_tgt.h"
 
 #include "spdk/bdev.h"
 #include "spdk/event.h"
+#include "spdk/io_channel.h"
 #include "spdk/log.h"
 #include "spdk/nvme.h"
-#include "spdk/io_channel.h"
+#include "spdk/util.h"
 
-#define SPDK_NVMF_BUILD_ETC "/usr/local/etc/nvmf"
-#define SPDK_NVMF_DEFAULT_CONFIG SPDK_NVMF_BUILD_ETC "/nvmf.conf"
+struct nvmf_tgt_poll_group {
+	struct spdk_nvmf_poll_group *group;
+};
+
+struct nvmf_tgt g_tgt = {};
+
+static struct nvmf_tgt_poll_group *g_poll_groups = NULL;
+static size_t g_num_poll_groups = 0;
+static size_t g_active_poll_groups = 0;
 
 static struct spdk_poller *g_acceptor_poller = NULL;
 
-static TAILQ_HEAD(, nvmf_tgt_subsystem) g_subsystems = TAILQ_HEAD_INITIALIZER(g_subsystems);
-static bool g_subsystems_shutdown;
+static void nvmf_tgt_advance_state(void *arg1, void *arg2);
 
 static void
-shutdown_complete(void)
+_spdk_nvmf_shutdown_cb(void *arg1, void *arg2)
 {
-	spdk_app_stop(0);
-}
-
-static void
-subsystem_delete_event(struct spdk_event *event)
-{
-	struct nvmf_tgt_subsystem *app_subsys = spdk_event_get_arg1(event);
-	struct spdk_nvmf_subsystem *subsystem = app_subsys->subsystem;
-
-	TAILQ_REMOVE(&g_subsystems, app_subsys, tailq);
-	free(app_subsys);
-
-	spdk_nvmf_delete_subsystem(subsystem);
-
-	if (g_subsystems_shutdown && TAILQ_EMPTY(&g_subsystems)) {
-		/* Finished shutting down all subsystems - continue the shutdown process. */
-		shutdown_complete();
-	}
-}
-
-static void
-nvmf_tgt_delete_subsystem(struct nvmf_tgt_subsystem *app_subsys)
-{
-	struct spdk_nvmf_subsystem *subsystem = app_subsys->subsystem;
-	struct spdk_event *event;
-	int i;
-
-	if (spdk_nvmf_subsystem_get_type(subsystem) == SPDK_NVMF_SUBTYPE_NVME &&
-	    spdk_nvmf_subsystem_get_mode(subsystem) == NVMF_SUBSYSTEM_MODE_VIRTUAL) {
-		for (i = 0; i < subsystem->dev.virt.ns_count; i++) {
-			spdk_put_io_channel(subsystem->dev.virt.ch[i]);
-			subsystem->dev.virt.ch[i] = NULL;
-		}
+	/* Still in initialization state, defer shutdown operation */
+	if (g_tgt.state < NVMF_TGT_RUNNING) {
+		spdk_event_call(spdk_event_allocate(spdk_env_get_current_core(),
+						    _spdk_nvmf_shutdown_cb, NULL, NULL));
+		return;
+	} else if (g_tgt.state > NVMF_TGT_RUNNING) {
+		/* Already in Shutdown status, ignore the signal */
+		return;
 	}
 
-	/*
-	 * Unregister the poller - this starts a chain of events that will eventually free
-	 * the subsystem's memory.
-	 */
-	event = spdk_event_allocate(spdk_app_get_current_core(), subsystem_delete_event,
-				    app_subsys, NULL, NULL);
-	spdk_poller_unregister(&app_subsys->poller, event);
-}
-
-static void
-shutdown_subsystems(void)
-{
-	struct nvmf_tgt_subsystem *app_subsys, *tmp;
-
-	g_subsystems_shutdown = true;
-	TAILQ_FOREACH_SAFE(app_subsys, &g_subsystems, tailq, tmp) {
-		nvmf_tgt_delete_subsystem(app_subsys);
-	}
-}
-
-static void
-acceptor_poller_unregistered_event(struct spdk_event *event)
-{
-	spdk_nvmf_tgt_fini();
-	shutdown_subsystems();
+	g_tgt.state = NVMF_TGT_FINI_STOP_ACCEPTOR;
+	nvmf_tgt_advance_state(NULL, NULL);
 }
 
 static void
 spdk_nvmf_shutdown_cb(void)
 {
-	struct spdk_event *event;
+	printf("\n=========================\n");
+	printf("   NVMF shutdown signal\n");
+	printf("=========================\n");
 
-	fprintf(stdout, "\n=========================\n");
-	fprintf(stdout, "   NVMF shutdown signal\n");
-	fprintf(stdout, "=========================\n");
-
-	event = spdk_event_allocate(spdk_app_get_current_core(), acceptor_poller_unregistered_event,
-				    NULL, NULL, NULL);
-	spdk_poller_unregister(&g_acceptor_poller, event);
-}
-
-static void
-subsystem_poll(void *arg)
-{
-	struct nvmf_tgt_subsystem *app_subsys = arg;
-
-	spdk_nvmf_subsystem_poll(app_subsys->subsystem);
-}
-
-static void
-connect_event(struct spdk_event *event)
-{
-	struct spdk_nvmf_request *req = spdk_event_get_arg1(event);
-
-	spdk_nvmf_handle_connect(req);
-}
-
-static void
-connect_cb(void *cb_ctx, struct spdk_nvmf_request *req)
-{
-	struct nvmf_tgt_subsystem *app_subsys = cb_ctx;
-	struct spdk_event *event;
-
-	/* Pass an event to the lcore that owns this subsystem */
-	event = spdk_event_allocate(app_subsys->lcore, connect_event, req, NULL, NULL);
-	spdk_event_call(event);
-}
-
-static void
-disconnect_event(struct spdk_event *event)
-{
-	struct spdk_nvmf_conn *conn = spdk_event_get_arg1(event);
-
-	spdk_nvmf_session_disconnect(conn);
-}
-
-static void
-disconnect_cb(void *cb_ctx, struct spdk_nvmf_conn *conn)
-{
-	struct nvmf_tgt_subsystem *app_subsys = cb_ctx;
-	struct spdk_event *event;
-
-	/* Pass an event to the core that owns this connection */
-	event = spdk_event_allocate(app_subsys->lcore, disconnect_event, conn, NULL, NULL);
-	spdk_event_call(event);
-}
-
-static void
-_nvmf_tgt_start_subsystem(struct spdk_event *event)
-{
-	struct nvmf_tgt_subsystem *app_subsys = spdk_event_get_arg1(event);
-	struct spdk_nvmf_subsystem *subsystem = app_subsys->subsystem;
-	struct spdk_bdev *bdev;
-	struct spdk_io_channel *ch;
-	int lcore = spdk_app_get_current_core();
-	int i;
-
-	if (subsystem->subtype == SPDK_NVMF_SUBTYPE_NVME &&
-	    subsystem->mode == NVMF_SUBSYSTEM_MODE_VIRTUAL) {
-		for (i = 0; i < subsystem->dev.virt.ns_count; i++) {
-			bdev = subsystem->dev.virt.ns_list[i];
-			ch = spdk_bdev_get_io_channel(bdev, SPDK_IO_PRIORITY_DEFAULT);
-			assert(ch != NULL);
-			subsystem->dev.virt.ch[i] = ch;
-		}
+	/* Always let the first core to handle the case */
+	if (spdk_env_get_current_core() != spdk_env_get_first_core()) {
+		spdk_event_call(spdk_event_allocate(spdk_env_get_first_core(),
+						    _spdk_nvmf_shutdown_cb, NULL, NULL));
+	} else {
+		_spdk_nvmf_shutdown_cb(NULL, NULL);
 	}
-
-	spdk_poller_register(&app_subsys->poller, subsystem_poll, app_subsys, lcore, NULL, 0);
 }
 
-void
-nvmf_tgt_start_subsystem(struct nvmf_tgt_subsystem *app_subsys)
-{
-	spdk_event_t event;
-
-	event = spdk_event_allocate(app_subsys->lcore, _nvmf_tgt_start_subsystem,
-				    app_subsys, NULL, NULL);
-	spdk_event_call(event);
-}
-
-struct nvmf_tgt_subsystem *
-nvmf_tgt_create_subsystem(const char *name, enum spdk_nvmf_subtype subtype,
-			  enum spdk_nvmf_subsystem_mode mode, uint32_t lcore)
+struct spdk_nvmf_subsystem *
+nvmf_tgt_create_subsystem(const char *name, enum spdk_nvmf_subtype subtype, uint32_t num_ns)
 {
 	struct spdk_nvmf_subsystem *subsystem;
-	struct nvmf_tgt_subsystem *app_subsys;
 
-	if (spdk_nvmf_subsystem_exists(name)) {
+	if (spdk_nvmf_tgt_find_subsystem(g_tgt.tgt, name)) {
 		SPDK_ERRLOG("Subsystem already exist\n");
 		return NULL;
 	}
 
-	app_subsys = calloc(1, sizeof(*app_subsys));
-	if (app_subsys == NULL) {
-		SPDK_ERRLOG("Subsystem allocation failed\n");
-		return NULL;
-	}
-
-	subsystem = spdk_nvmf_create_subsystem(name, subtype, mode, app_subsys, connect_cb,
-					       disconnect_cb);
+	subsystem = spdk_nvmf_subsystem_create(g_tgt.tgt, name, subtype, num_ns);
 	if (subsystem == NULL) {
 		SPDK_ERRLOG("Subsystem creation failed\n");
-		free(app_subsys);
 		return NULL;
 	}
 
-	app_subsys->subsystem = subsystem;
-	app_subsys->lcore = lcore;
+	SPDK_NOTICELOG("allocated subsystem %s\n", name);
 
-	SPDK_NOTICELOG("allocated subsystem %s on lcore %u on socket %u\n", name, lcore,
-		       rte_lcore_to_socket_id(lcore));
-
-	TAILQ_INSERT_TAIL(&g_subsystems, app_subsys, tailq);
-
-	return app_subsys;
-}
-
-/* This function can only be used before the pollers are started. */
-static void
-nvmf_tgt_delete_subsystems(void)
-{
-	struct nvmf_tgt_subsystem *app_subsys, *tmp;
-	struct spdk_nvmf_subsystem *subsystem;
-
-	TAILQ_FOREACH_SAFE(app_subsys, &g_subsystems, tailq, tmp) {
-		subsystem = app_subsys->subsystem;
-		spdk_nvmf_delete_subsystem(subsystem);
-		free(app_subsys);
-	}
-}
-
-struct nvmf_tgt_subsystem *
-nvmf_tgt_subsystem_first(void)
-{
-	return TAILQ_FIRST(&g_subsystems);
-}
-
-struct nvmf_tgt_subsystem *
-nvmf_tgt_subsystem_next(struct nvmf_tgt_subsystem *subsystem)
-{
-	return TAILQ_NEXT(subsystem, tailq);
-}
-
-int
-nvmf_tgt_shutdown_subsystem_by_nqn(const char *nqn)
-{
-	struct nvmf_tgt_subsystem *tgt_subsystem, *subsys_tmp;
-
-	TAILQ_FOREACH_SAFE(tgt_subsystem, &g_subsystems, tailq, subsys_tmp) {
-		if (strcmp(tgt_subsystem->subsystem->subnqn, nqn) == 0) {
-			TAILQ_REMOVE(&g_subsystems, tgt_subsystem, tailq);
-			nvmf_tgt_delete_subsystem(tgt_subsystem);
-			return 0;
-		}
-	}
-	return -1;
+	return subsystem;
 }
 
 static void
-usage(void)
+nvmf_tgt_poll_group_add(void *arg1, void *arg2)
 {
-	printf("nvmf [options]\n");
-	printf("options:\n");
-	printf(" -c config  - config file (default %s)\n", SPDK_NVMF_DEFAULT_CONFIG);
-	printf(" -e mask    - tracepoint group mask for spdk trace buffers (default 0x0)\n");
-	printf(" -m mask    - core mask for DPDK\n");
-	printf(" -i instance ID\n");
-	printf(" -l facility - use specific syslog facility (default %s)\n",
-	       SPDK_APP_DEFAULT_LOG_FACILITY);
-	printf(" -n channel number of memory channels used for DPDK\n");
-	printf(" -p core    master (primary) core for DPDK\n");
-	printf(" -s size    memory size in MB for DPDK\n");
+	struct spdk_nvmf_qpair *qpair = arg1;
+	struct nvmf_tgt_poll_group *pg = arg2;
 
-	spdk_tracelog_usage(stdout, "-t");
+	spdk_nvmf_poll_group_add(pg->group, qpair);
+}
 
-	printf(" -v         - verbose (enable warnings)\n");
-	printf(" -H         - show this usage\n");
-	printf(" -d         - disable coredump file enabling\n");
+static void
+new_qpair(struct spdk_nvmf_qpair *qpair)
+{
+	struct spdk_event *event;
+	struct nvmf_tgt_poll_group *pg;
+	uint32_t core;
+
+	core = g_tgt.core;
+	g_tgt.core = spdk_env_get_next_core(core);
+	if (g_tgt.core == UINT32_MAX) {
+		g_tgt.core = spdk_env_get_first_core();
+	}
+
+	pg = &g_poll_groups[core];
+	assert(pg != NULL);
+
+	event = spdk_event_allocate(core, nvmf_tgt_poll_group_add, qpair, pg);
+	spdk_event_call(event);
 }
 
 static void
 acceptor_poll(void *arg)
 {
-	spdk_nvmf_acceptor_poll();
+	struct spdk_nvmf_tgt *tgt = arg;
+
+	spdk_nvmf_tgt_accept(tgt, new_qpair);
 }
 
 static void
-spdk_nvmf_startup(spdk_event_t event)
+nvmf_tgt_destroy_poll_group_done(void *ctx)
 {
-	int rc;
-
-	rc = spdk_nvmf_parse_conf();
-	if (rc < 0) {
-		nvmf_tgt_delete_subsystems();
-		SPDK_ERRLOG("spdk_nvmf_parse_conf() failed\n");
-		goto initialize_error;
-	}
-
-	if (((1ULL << g_spdk_nvmf_tgt_conf.acceptor_lcore) & spdk_app_get_core_mask()) == 0) {
-		SPDK_ERRLOG("Invalid AcceptorCore setting\n");
-		goto initialize_error;
-	}
-
-	spdk_poller_register(&g_acceptor_poller, acceptor_poll, NULL,
-			     g_spdk_nvmf_tgt_conf.acceptor_lcore, NULL,
-			     g_spdk_nvmf_tgt_conf.acceptor_poll_rate);
-
-	SPDK_NOTICELOG("Acceptor running on core %u on socket %u\n", g_spdk_nvmf_tgt_conf.acceptor_lcore,
-		       rte_lcore_to_socket_id(g_spdk_nvmf_tgt_conf.acceptor_lcore));
-
-	if (getenv("MEMZONE_DUMP") != NULL) {
-		spdk_memzone_dump(stdout);
-		fflush(stdout);
-	}
-
-	return;
-
-initialize_error:
-	spdk_app_stop(rc);
+	g_tgt.state = NVMF_TGT_FINI_FREE_RESOURCES;
+	nvmf_tgt_advance_state(NULL, NULL);
 }
 
-/*! \file
+static void
+nvmf_tgt_destroy_poll_group(void *ctx)
+{
+	struct nvmf_tgt_poll_group *pg;
 
-This is the main file.
+	pg = &g_poll_groups[spdk_env_get_current_core()];
+	assert(pg != NULL);
 
-*/
+	spdk_nvmf_poll_group_destroy(pg->group);
+	pg->group = NULL;
 
-/*!
+	assert(g_active_poll_groups > 0);
+	g_active_poll_groups--;
+}
 
-\brief This is the main function for the NVMf target application.
+static void
+nvmf_tgt_create_poll_group_done(void *ctx)
+{
+	g_tgt.state = NVMF_TGT_INIT_START_SUBSYSTEMS;
+	nvmf_tgt_advance_state(NULL, NULL);
+}
 
-\msc
+static void
+nvmf_tgt_create_poll_group(void *ctx)
+{
+	struct nvmf_tgt_poll_group *pg;
 
-	c_runtime [label="C Runtime"], dpdk [label="DPDK"], nvmf [label="NVMf target"];
-	c_runtime=>nvmf [label="main()"];
-	nvmf=> [label="rte_eal_init()"];
-	nvmf=>nvmf [label="spdk_app_init()"];
-	nvmf=>nvmf [label="spdk_event_allocate()"];
-	nvmf=>nvmf [label="spdk_app_start()"];
-	nvmf=>nvmf [label="spdk_app_fini()"];
-	c_runtime<<nvmf;
+	pg = &g_poll_groups[spdk_env_get_current_core()];
+	assert(pg != NULL);
 
-\endmsc
+	pg->group = spdk_nvmf_poll_group_create(g_tgt.tgt);
+	if (pg->group == NULL) {
+		SPDK_ERRLOG("Failed to create poll group for core %u\n", spdk_env_get_current_core());
+	}
 
-*/
+	g_active_poll_groups++;
+}
+
+static void
+nvmf_tgt_subsystem_started(struct spdk_nvmf_subsystem *subsystem,
+			   void *cb_arg, int status)
+{
+	subsystem = spdk_nvmf_subsystem_get_next(subsystem);
+
+	if (subsystem) {
+		spdk_nvmf_subsystem_start(subsystem, nvmf_tgt_subsystem_started, NULL);
+		return;
+	}
+
+	g_tgt.state = NVMF_TGT_INIT_START_ACCEPTOR;
+	nvmf_tgt_advance_state(NULL, NULL);
+}
+
+static void
+nvmf_tgt_subsystem_stopped(struct spdk_nvmf_subsystem *subsystem,
+			   void *cb_arg, int status)
+{
+	subsystem = spdk_nvmf_subsystem_get_next(subsystem);
+
+	if (subsystem) {
+		spdk_nvmf_subsystem_stop(subsystem, nvmf_tgt_subsystem_stopped, NULL);
+		return;
+	}
+
+	g_tgt.state = NVMF_TGT_FINI_DESTROY_POLL_GROUPS;
+	nvmf_tgt_advance_state(NULL, NULL);
+}
+
+static void
+nvmf_tgt_advance_state(void *arg1, void *arg2)
+{
+	enum nvmf_tgt_state prev_state;
+	int rc = -1;
+
+	do {
+		prev_state = g_tgt.state;
+
+		switch (g_tgt.state) {
+		case NVMF_TGT_INIT_NONE: {
+			g_tgt.state = NVMF_TGT_INIT_PARSE_CONFIG;
+
+			/* Find the maximum core number */
+			g_num_poll_groups = spdk_env_get_last_core() + 1;
+			assert(g_num_poll_groups > 0);
+
+			g_poll_groups = calloc(g_num_poll_groups, sizeof(*g_poll_groups));
+			if (g_poll_groups == NULL) {
+				g_tgt.state = NVMF_TGT_ERROR;
+				rc = -ENOMEM;
+				break;
+			}
+
+			g_tgt.core = spdk_env_get_first_core();
+			break;
+		}
+		case NVMF_TGT_INIT_PARSE_CONFIG:
+			rc = spdk_nvmf_parse_conf();
+			if (rc < 0) {
+				SPDK_ERRLOG("spdk_nvmf_parse_conf() failed\n");
+				g_tgt.state = NVMF_TGT_ERROR;
+				rc = -EINVAL;
+				break;
+			}
+			g_tgt.state = NVMF_TGT_INIT_CREATE_POLL_GROUPS;
+			break;
+		case NVMF_TGT_INIT_CREATE_POLL_GROUPS:
+			/* Send a message to each thread and create a poll group */
+			spdk_for_each_thread(nvmf_tgt_create_poll_group,
+					     NULL,
+					     nvmf_tgt_create_poll_group_done);
+			break;
+		case NVMF_TGT_INIT_START_SUBSYSTEMS: {
+			struct spdk_nvmf_subsystem *subsystem;
+
+			subsystem = spdk_nvmf_subsystem_get_first(g_tgt.tgt);
+
+			if (subsystem) {
+				spdk_nvmf_subsystem_start(subsystem, nvmf_tgt_subsystem_started, NULL);
+			} else {
+				g_tgt.state = NVMF_TGT_INIT_START_ACCEPTOR;
+			}
+			break;
+		}
+		case NVMF_TGT_INIT_START_ACCEPTOR:
+			g_acceptor_poller = spdk_poller_register(acceptor_poll, g_tgt.tgt,
+					    g_spdk_nvmf_tgt_conf.acceptor_poll_rate);
+			SPDK_NOTICELOG("Acceptor running\n");
+			g_tgt.state = NVMF_TGT_RUNNING;
+			break;
+		case NVMF_TGT_RUNNING:
+			if (getenv("MEMZONE_DUMP") != NULL) {
+				spdk_memzone_dump(stdout);
+				fflush(stdout);
+			}
+			break;
+		case NVMF_TGT_FINI_STOP_ACCEPTOR:
+			spdk_poller_unregister(&g_acceptor_poller);
+			g_tgt.state = NVMF_TGT_FINI_STOP_SUBSYSTEMS;
+			break;
+		case NVMF_TGT_FINI_STOP_SUBSYSTEMS: {
+			struct spdk_nvmf_subsystem *subsystem;
+
+			subsystem = spdk_nvmf_subsystem_get_first(g_tgt.tgt);
+
+			if (subsystem) {
+				spdk_nvmf_subsystem_stop(subsystem, nvmf_tgt_subsystem_stopped, NULL);
+			} else {
+				g_tgt.state = NVMF_TGT_FINI_DESTROY_POLL_GROUPS;
+			}
+			break;
+		}
+		case NVMF_TGT_FINI_DESTROY_POLL_GROUPS:
+			/* Send a message to each thread and destroy the poll group */
+			spdk_for_each_thread(nvmf_tgt_destroy_poll_group,
+					     NULL,
+					     nvmf_tgt_destroy_poll_group_done);
+			break;
+		case NVMF_TGT_FINI_FREE_RESOURCES:
+			spdk_nvmf_tgt_destroy(g_tgt.tgt);
+			g_tgt.state = NVMF_TGT_STOPPED;
+			break;
+		case NVMF_TGT_STOPPED:
+			spdk_app_stop(0);
+			return;
+		case NVMF_TGT_ERROR:
+			spdk_app_stop(rc);
+			return;
+		}
+
+	} while (g_tgt.state != prev_state);
+}
 
 int
-main(int argc, char **argv)
+spdk_nvmf_tgt_start(struct spdk_app_opts *opts)
 {
-	int ch;
 	int rc;
-	struct spdk_app_opts opts = {};
 
-	/* default value in opts */
-	spdk_app_opts_init(&opts);
+	opts->shutdown_cb = spdk_nvmf_shutdown_cb;
 
-	opts.name = "nvmf";
-	opts.config_file = SPDK_NVMF_DEFAULT_CONFIG;
-	opts.max_delay_us = 1000; /* 1 ms */
-
-	while ((ch = getopt(argc, argv, "c:de:i:l:m:n:p:qs:t:DH")) != -1) {
-		switch (ch) {
-		case 'd':
-			opts.enable_coredump = false;
-			break;
-		case 'c':
-			opts.config_file = optarg;
-			break;
-		case 'i':
-			opts.instance_id = atoi(optarg);
-			break;
-		case 'l':
-			opts.log_facility = optarg;
-			break;
-		case 't':
-			rc = spdk_log_set_trace_flag(optarg);
-			if (rc < 0) {
-				fprintf(stderr, "unknown flag\n");
-				usage();
-				exit(EXIT_FAILURE);
-			}
-#ifndef DEBUG
-			fprintf(stderr, "%s must be rebuilt with CONFIG_DEBUG=y for -t flag.\n",
-				argv[0]);
-			usage();
-			exit(EXIT_FAILURE);
-#endif
-			break;
-		case 'm':
-			opts.reactor_mask = optarg;
-			break;
-		case 'n':
-			opts.dpdk_mem_channel = atoi(optarg);
-			break;
-		case 'p':
-			opts.dpdk_master_core = atoi(optarg);
-			break;
-		case 's':
-			opts.dpdk_mem_size = atoi(optarg);
-			break;
-		case 'e':
-			opts.tpoint_group_mask = optarg;
-			break;
-		case 'q':
-			spdk_g_notice_stderr_flag = 0;
-			break;
-		case 'D':
-		case 'H':
-		default:
-			usage();
-			exit(EXIT_SUCCESS);
-		}
-	}
-
-	if (spdk_g_notice_stderr_flag == 1 &&
-	    isatty(STDERR_FILENO) &&
-	    !strncmp(ttyname(STDERR_FILENO), "/dev/tty", strlen("/dev/tty"))) {
-		printf("Warning: printing stderr to console terminal without -q option specified.\n");
-		printf("Suggest using -q to disable logging to stderr and monitor syslog, or\n");
-		printf("redirect stderr to a file.\n");
-		printf("(Delaying for 10 seconds...)\n");
-		sleep(10);
-	}
-
-	opts.shutdown_cb = spdk_nvmf_shutdown_cb;
-	spdk_app_init(&opts);
-
-	printf("Total cores available: %d\n", rte_lcore_count());
 	/* Blocks until the application is exiting */
-	rc = spdk_app_start(spdk_nvmf_startup, NULL, NULL);
+	rc = spdk_app_start(opts, nvmf_tgt_advance_state, NULL, NULL);
 
 	spdk_app_fini();
 

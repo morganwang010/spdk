@@ -34,7 +34,7 @@
 SPDK_ROOT_DIR := $(abspath $(CURDIR)/../../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
-DIRS-y = bit_array io_channel
+DIRS-y = histogram_perf
 
 .PHONY: all clean $(DIRS-y)
 
